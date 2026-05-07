@@ -86,6 +86,11 @@ pub fn findPricing(model: []const u8) ?ModelPricing {
     return null;
 }
 
+/// Returns a comptime-static slice that may outlive the input.
+pub fn staticPrefixOf(model: []const u8) []const u8 {
+    return if (findPricing(model)) |p| p.prefix else "unknown";
+}
+
 const fast_multiplier: f64 = 6.0;
 
 pub fn calculateEntryCost(pricing: ModelPricing, usage: TokenUsage) f64 {

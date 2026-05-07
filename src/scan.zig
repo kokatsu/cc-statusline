@@ -28,6 +28,12 @@ const cache_ver: u32 = 5;
 const file_list_ttl_s: i64 = 300;
 // Actual caches are ~tens of KB; cap at 1 MiB to fail fast on corruption.
 const cache_max_bytes: usize = 1 * 1024 * 1024;
+// Reader buffer for JSONL streaming; must hold one full line.
+const jsonl_buf_size: usize = 64 * 1024;
+// Fast-reject prefilter for lines that lack a usage block. Must stay in sync
+// with the JSON key matched at `Parser.parseUsage` — drift only degrades
+// throughput (the prefilter becomes useless), it never silently drops entries.
+const usage_marker = "\"input_tokens\"";
 
 // ============================================================
 // Types
@@ -134,12 +140,46 @@ fn scanDirRecursive(allocator: std.mem.Allocator, dir_path: []const u8, files: *
 }
 
 pub fn parseJsonlContent(allocator: std.mem.Allocator, dedup_alloc: std.mem.Allocator, content: []const u8, entries: *std.ArrayList(TranscriptEntry), seen: *std.StringHashMapUnmanaged(void)) void {
-    var lines = mem.splitSequence(u8, content, "\n");
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (mem.indexOf(u8, line, "\"input_tokens\"") == null) continue;
-        parseJsonlLine(allocator, dedup_alloc, line, entries, seen) catch continue;
+    var reader = std.Io.Reader.fixed(content);
+    parseJsonlReader(allocator, dedup_alloc, &reader, entries, seen);
+}
+
+/// Lines exceeding the reader buffer capacity are spilled into a heap buffer
+/// so a single large transcript entry cannot silently disappear from cost totals.
+pub fn parseJsonlReader(
+    allocator: std.mem.Allocator,
+    dedup_alloc: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    entries: *std.ArrayList(TranscriptEntry),
+    seen: *std.StringHashMapUnmanaged(void),
+) void {
+    while (true) {
+        const line_opt = reader.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => {
+                var aw: std.Io.Writer.Allocating = .init(allocator);
+                defer aw.deinit();
+                _ = reader.streamDelimiterEnding(&aw.writer, '\n') catch return;
+                _ = reader.discardDelimiterInclusive('\n') catch {};
+                handleLine(allocator, dedup_alloc, aw.written(), entries, seen);
+                continue;
+            },
+            error.ReadFailed => return,
+        };
+        const line = line_opt orelse return;
+        handleLine(allocator, dedup_alloc, line, entries, seen);
     }
+}
+
+fn handleLine(
+    allocator: std.mem.Allocator,
+    dedup_alloc: std.mem.Allocator,
+    line: []const u8,
+    entries: *std.ArrayList(TranscriptEntry),
+    seen: *std.StringHashMapUnmanaged(void),
+) void {
+    if (line.len == 0) return;
+    if (mem.indexOf(u8, line, usage_marker) == null) return;
+    parseJsonlLine(allocator, dedup_alloc, line, entries, seen) catch {};
 }
 
 const Parser = struct {
@@ -324,7 +364,7 @@ fn parseJsonlLine(
 
     try entries.append(allocator, .{
         .timestamp_ms = timestamp_ms,
-        .model = p.model,
+        .model = pricing.staticPrefixOf(p.model),
         .usage = .{
             .input_tokens = p.input_tokens,
             .output_tokens = p.output_tokens,
@@ -662,15 +702,12 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
             parse_file: {
                 var f = Io.Dir.openFileAbsolute(g_io, ch.path, .{}) catch break :parse_file;
                 defer f.close(g_io);
-                var rbuf: [8192]u8 = undefined;
+                var rbuf: [jsonl_buf_size]u8 = undefined;
                 var reader = f.reader(g_io, &rbuf);
                 if (ch.parsed_size > 0) {
                     reader.seekTo(@intCast(ch.parsed_size)) catch break :parse_file;
                 }
-                const content = reader.interface.allocRemaining(allocator, .limited(100 * 1024 * 1024)) catch break :parse_file;
-                if (content.len > 0) {
-                    parseJsonlContent(allocator, allocator, content, &entries, &global_seen);
-                }
+                parseJsonlReader(allocator, allocator, &reader.interface, &entries, &global_seen);
             }
 
             var today_file_diff_cost: f64 = 0;
@@ -742,20 +779,15 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
 
         var f = Io.Dir.openFileAbsolute(g_io, fi.path, .{}) catch continue;
         defer f.close(g_io);
-        var rbuf: [8192]u8 = undefined;
+        var rbuf: [jsonl_buf_size]u8 = undefined;
         var reader = f.readerStreaming(g_io, &rbuf);
-        const content = reader.interface.allocRemaining(tmp, .limited(100 * 1024 * 1024)) catch continue;
 
         var file_entries: std.ArrayList(TranscriptEntry) = .empty;
-        parseJsonlContent(tmp, allocator, content, &file_entries, &global_seen);
+        parseJsonlReader(tmp, allocator, &reader.interface, &file_entries, &global_seen);
 
         const start_idx = all_entries.items.len;
         for (file_entries.items) |entry| {
-            all_entries.append(allocator, .{
-                .timestamp_ms = entry.timestamp_ms,
-                .model = allocator.dupe(u8, entry.model) catch "unknown",
-                .usage = entry.usage,
-            }) catch continue;
+            all_entries.append(allocator, entry) catch continue;
         }
 
         const new_items = all_entries.items[start_idx..];
@@ -1146,6 +1178,40 @@ test "parseJsonlContent model fallback to unknown" {
     parseJsonlContent(alloc, alloc, line, &entries, &seen);
     try std.testing.expectEqual(@as(usize, 1), entries.items.len);
     try std.testing.expectEqualStrings("unknown", entries.items[0].model);
+}
+
+test "parseJsonlReader recovers lines exceeding the reader buffer" {
+    const path = "/tmp/cc-test-long-line.jsonl";
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const padding = try alloc.alloc(u8, 4096);
+    @memset(padding, 'x');
+    const line = try std.fmt.allocPrint(
+        alloc,
+        "{{\"timestamp\":\"2025-06-15T10:00:00Z\",\"requestId\":\"r1\",\"message\":{{\"id\":\"m1\",\"model\":\"claude-sonnet-4-5\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":50}}}},\"pad\":\"{s}\"}}\n",
+        .{padding},
+    );
+
+    try createTmpFile(path, line);
+    defer removeTmpFile(path);
+
+    var f = try Io.Dir.openFileAbsolute(std.testing.io, path, .{});
+    defer f.close(std.testing.io);
+    // rbuf < line length (4096 padding) forces takeDelimiter into the
+    // StreamTooLong / heap-fallback path under test.
+    var rbuf: [1024]u8 = undefined;
+    var reader = f.readerStreaming(std.testing.io, &rbuf);
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    parseJsonlReader(alloc, alloc, &reader.interface, &entries, &seen);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqual(@as(i64, 100), entries.items[0].usage.input_tokens);
+    try std.testing.expectEqual(@as(i64, 50), entries.items[0].usage.output_tokens);
 }
 
 // --- diffScan ---
