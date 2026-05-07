@@ -55,15 +55,88 @@ fn computeStats(samples: []u64) Stats {
 
 // ─── Fixture generation ───────────────────────────────────────────────────
 
-/// Writes one synthetic JSONL line with all fields parseJsonlContent reads.
-/// Each line gets a unique msg_id:req_id so dedup keeps every entry.
-fn writeFixtureLine(w: *Io.Writer, file_idx: u32, line_idx: u32, ts_ms: i64) !void {
+/// Mix of behaviours that exist in real Claude Code transcripts but were
+/// missing from the original synthetic fixture: dedup hits (resumed sessions),
+/// model variety, tier-boundary usage, and fast-mode entries. Tweak with care
+/// — changing any value invalidates `bench/baseline.json`.
+const fixture_seed: u64 = 0xb3c5_1ed5_a55e_d42c;
+const intra_dup_pct: u8 = 7; // resumed-session reuse within one file
+const cross_dup_pct: u8 = 5; // resumed-session reuse from previous file
+const usage_200k_pct: u8 = 50; // exercise the 200k tier branch
+const fast_pct: u8 = 5; // exercise the fast-mode 6× multiplier
+
+const ring_capacity: usize = 256;
+
+const RingEntry = struct { file: u32, line: u32 };
+
+/// Tracks the most recent msg/req keys produced for a file. Newer entries
+/// overwrite the oldest once the buffer fills, so sampling stays bounded
+/// regardless of fixture size.
+const RingBuffer = struct {
+    entries: [ring_capacity]RingEntry = undefined,
+    len: usize = 0,
+    head: usize = 0,
+
+    fn push(self: *RingBuffer, e: RingEntry) void {
+        self.entries[self.head] = e;
+        self.head = (self.head + 1) % ring_capacity;
+        if (self.len < ring_capacity) self.len += 1;
+    }
+
+    fn sample(self: RingBuffer, rng: std.Random) RingEntry {
+        return self.entries[rng.uintLessThan(usize, self.len)];
+    }
+};
+
+const FixtureStats = struct {
+    bytes: u64 = 0,
+    intra_dups: u64 = 0,
+    cross_dups: u64 = 0,
+};
+
+const UsageProfile = struct {
+    input: i64,
+    output: i64,
+    cc_5m: i64,
+    cr: i64,
+    is_fast: bool,
+};
+
+const usage_regular: UsageProfile = .{ .input = 150, .output = 80, .cc_5m = 0, .cr = 0, .is_fast = false };
+const usage_fast: UsageProfile = .{ .input = 150, .output = 80, .cc_5m = 0, .cr = 0, .is_fast = true };
+// 180k input + 30k cache_creation + 10k cache_read = 220k total → premium tier.
+const usage_premium: UsageProfile = .{ .input = 180_000, .output = 5_000, .cc_5m = 30_000, .cr = 10_000, .is_fast = false };
+
+fn pickModel(roll: u8) []const u8 {
+    if (roll < 70) return "claude-sonnet-4-5-20250929";
+    if (roll < 90) return "claude-opus-4-5-20251212";
+    return "claude-haiku-4-5-20251001";
+}
+
+fn pickUsage(roll: u8) UsageProfile {
+    if (roll < usage_200k_pct) return usage_premium;
+    if (roll < usage_200k_pct + fast_pct) return usage_fast;
+    return usage_regular;
+}
+
+/// `key_file`/`key_line` may differ from the writing position when this row
+/// is a dedup hit — they pin the msg/req IDs to a previously emitted row so
+/// scan's seen-set treats it as a duplicate.
+fn writeFixtureLine(
+    w: *Io.Writer,
+    key_file: u32,
+    key_line: u32,
+    ts_ms: i64,
+    model: []const u8,
+    usage: UsageProfile,
+) !void {
     var date_buf: [32]u8 = undefined;
     const ts = formatIsoUtc(&date_buf, ts_ms);
+    const speed = if (usage.is_fast) ",\"speed\":\"fast\"" else "";
     try w.print(
-        \\{{"timestamp":"{s}","requestId":"req-f{d}-l{d}","message":{{"id":"msg-f{d}-l{d}","model":"claude-sonnet-4-5-20250929","usage":{{"input_tokens":150,"output_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}
+        \\{{"timestamp":"{s}","requestId":"req-f{d}-l{d}","message":{{"id":"msg-f{d}-l{d}","model":"{s}","usage":{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":{d},"cache_read_input_tokens":{d}{s}}}}}}}
         \\
-    , .{ ts, file_idx, line_idx, file_idx, line_idx });
+    , .{ ts, key_file, key_line, key_file, key_line, model, usage.input, usage.output, usage.cc_5m, usage.cr, speed });
 }
 
 /// Format ms-since-epoch as ISO 8601 UTC ("YYYY-MM-DDTHH:MM:SS.sssZ").
@@ -76,8 +149,8 @@ fn formatIsoUtc(buf: *[32]u8, ms: i64) []const u8 {
 }
 
 /// Build a fixture tree at `bench_root/projects/proj-bench/file-N.jsonl`.
-/// Returns total bytes written. Existing tree is wiped first.
-fn writeFixtures(io: Io, files: u32, lines: u32, now_ms: i64) !u64 {
+/// Returns generation stats (bytes + planned dedup counts). Existing tree is wiped first.
+fn writeFixtures(io: Io, files: u32, lines: u32, now_ms: i64) !FixtureStats {
     var tmp = try Io.Dir.openDirAbsolute(io, "/tmp", .{ .iterate = false });
     defer tmp.close(io);
     tmp.deleteTree(io, "cc-statusline-bench") catch {};
@@ -90,10 +163,14 @@ fn writeFixtures(io: Io, files: u32, lines: u32, now_ms: i64) !u64 {
     const total_lines: u64 = @as(u64, files) * @as(u64, lines);
     const step_ms: i64 = if (total_lines > 1) @divFloor(window_ms, @as(i64, @intCast(total_lines - 1))) else 0;
 
-    var total_bytes: u64 = 0;
     var path_buf: [256]u8 = undefined;
     var line_buf: [4096]u8 = undefined;
     var global_idx: u64 = 0;
+
+    var prng = std.Random.DefaultPrng.init(fixture_seed);
+    const rng = prng.random();
+    var prev_ring: RingBuffer = .{};
+    var stats: FixtureStats = .{};
 
     var fi: u32 = 0;
     while (fi < files) : (fi += 1) {
@@ -103,20 +180,46 @@ fn writeFixtures(io: Io, files: u32, lines: u32, now_ms: i64) !u64 {
         var fbuf: [16 * 1024]u8 = undefined;
         var w = f.writerStreaming(io, &fbuf);
 
+        var ring: RingBuffer = .{};
+
         var li: u32 = 0;
         while (li < lines) : (li += 1) {
             const ts = now_ms - window_ms + @as(i64, @intCast(global_idx)) * step_ms;
             global_idx += 1;
+
+            // Decide whether this row reuses a past msg/req key. Cross-file is
+            // checked first so its quota isn't crowded out by intra-file hits.
+            const dup_roll = rng.uintLessThan(u8, 100);
+            var key_file = fi;
+            var key_line = li;
+            if (dup_roll < cross_dup_pct and prev_ring.len > 0) {
+                const e = prev_ring.sample(rng);
+                key_file = e.file;
+                key_line = e.line;
+                stats.cross_dups += 1;
+            } else if (dup_roll < cross_dup_pct + intra_dup_pct and ring.len > 0) {
+                const e = ring.sample(rng);
+                key_file = e.file;
+                key_line = e.line;
+                stats.intra_dups += 1;
+            }
+
+            const model = pickModel(rng.uintLessThan(u8, 100));
+            const usage = pickUsage(rng.uintLessThan(u8, 100));
+
             // Format into a stack buffer first so we know the byte count.
             var stream: Io.Writer = .fixed(&line_buf);
-            try writeFixtureLine(&stream, fi, li, ts);
+            try writeFixtureLine(&stream, key_file, key_line, ts, model, usage);
             const bytes = stream.buffered();
             try w.interface.writeAll(bytes);
-            total_bytes += bytes.len;
+            stats.bytes += bytes.len;
+
+            ring.push(.{ .file = key_file, .line = key_line });
         }
         try w.interface.flush();
+        prev_ring = ring;
     }
-    return total_bytes;
+    return stats;
 }
 
 /// Read the entire contents of one fixture file (used by parseJsonlContent micro).
@@ -280,7 +383,7 @@ const Result = struct {
     size: []const u8,
     fixture_files: u32,
     fixture_lines: u32,
-    fixture_bytes: u64,
+    fixture_stats: FixtureStats,
     e2e_cold: Stats,
     e2e_warm: Stats,
     full_scan: Stats,
@@ -343,8 +446,12 @@ fn printResults(w: *Io.Writer, results: []const Result, baseline: ?BaselineMap) 
 
     for (results) |r| {
         var fb: [32]u8 = undefined;
-        try w.print("  fixture: {s} ({d} files × {d} lines, {s})\n", .{
-            r.size, r.fixture_files, r.fixture_lines, fmtBytes(&fb, r.fixture_bytes),
+        const fs = r.fixture_stats;
+        const total = @as(u64, r.fixture_files) * @as(u64, r.fixture_lines);
+        const dups = fs.intra_dups + fs.cross_dups;
+        try w.print("  fixture: {s} ({d} files × {d} lines, {s}, {d} unique / {d} dups: {d} intra + {d} cross)\n", .{
+            r.size,       r.fixture_files, r.fixture_lines, fmtBytes(&fb, fs.bytes),
+            total - dups, dups,            fs.intra_dups,   fs.cross_dups,
         });
         try w.writeAll("    scenario               median           min           p99\n");
         try w.writeAll("    ────────────────────────────────────────────────────────────\n");
@@ -501,7 +608,7 @@ pub fn main(init: std.process.Init) !void {
         try out.print("  generating fixture: {s} ({d} files × {d} lines)...\n", .{ sz.name, sz.files, sz.lines });
         try out.flush();
 
-        const bytes = try writeFixtures(io, sz.files, sz.lines, now_ms);
+        const fixture_stats = try writeFixtures(io, sz.files, sz.lines, now_ms);
         const content = try loadFirstFixture(io, allocator);
 
         const e2e_cold = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .cold, default_iters);
@@ -513,7 +620,7 @@ pub fn main(init: std.process.Init) !void {
             .size = sz.name,
             .fixture_files = sz.files,
             .fixture_lines = sz.lines,
-            .fixture_bytes = bytes,
+            .fixture_stats = fixture_stats,
             .e2e_cold = e2e_cold,
             .e2e_warm = e2e_warm,
             .full_scan = fs_stats,
