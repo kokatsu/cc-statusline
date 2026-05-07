@@ -134,9 +134,20 @@ fn writeFixtureLine(
     const ts = formatIsoUtc(&date_buf, ts_ms);
     const speed = if (usage.is_fast) ",\"speed\":\"fast\"" else "";
     try w.print(
-        \\{{"timestamp":"{s}","requestId":"req-f{d}-l{d}","message":{{"id":"msg-f{d}-l{d}","model":"{s}","usage":{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":{d},"cache_read_input_tokens":{d}{s}}}}}}}
+        \\{{"parentUuid":"par-f{d}-l{d}","isSidechain":false,"userType":"external","cwd":"/Users/bench/cc-statusline","sessionId":"ses-f{d}","version":"2.0.0","type":"assistant","uuid":"uid-f{d}-l{d}","timestamp":"{s}","requestId":"req-f{d}-l{d}","message":{{"id":"msg-f{d}-l{d}","type":"message","role":"assistant","model":"{s}","content":[{{"type":"text","text":"Assistant reply for entry f{d}-l{d}: lorem ipsum dolor sit amet consectetur adipiscing elit, sed do eiusmod tempor incididunt."}},{{"type":"tool_use","id":"toolu-f{d}-l{d}","name":"Edit","input":{{"file_path":"/Users/bench/cc-statusline/src/file.zig","old_string":"const a = 0;","new_string":"const a = 1;"}}}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":{d},"cache_read_input_tokens":{d}{s}}}}}}}
         \\
-    , .{ ts, key_file, key_line, key_file, key_line, model, usage.input, usage.output, usage.cc_5m, usage.cr, speed });
+    , .{
+        key_file,     key_line,
+        key_file,     key_file,
+        key_line,     ts,
+        key_file,     key_line,
+        key_file,     key_line,
+        model,        key_file,
+        key_line,     key_file,
+        key_line,     usage.input,
+        usage.output, usage.cc_5m,
+        usage.cr,     speed,
+    });
 }
 
 /// Format ms-since-epoch as ISO 8601 UTC ("YYYY-MM-DDTHH:MM:SS.sssZ").
