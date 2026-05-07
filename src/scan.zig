@@ -95,36 +95,39 @@ fn collectTranscriptFiles(allocator: std.mem.Allocator, projects_path: []const u
     };
     defer projects_dir.close(g_io);
 
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var proj_it = projects_dir.iterate();
     while (proj_it.next(g_io) catch null) |proj_entry| {
         if (proj_entry.kind != .directory) continue;
-        const proj_name = allocator.dupe(u8, proj_entry.name) catch continue;
-        scanDirRecursive(allocator, projects_path, proj_name, &files, cutoff_ms);
+        const proj_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ projects_path, proj_entry.name }) catch continue;
+        scanDirRecursive(allocator, proj_path, &files, cutoff_ms);
     }
 
     return files.toOwnedSlice(allocator) catch &.{};
 }
 
-fn scanDirRecursive(allocator: std.mem.Allocator, base_path: []const u8, rel_path: []const u8, files: *std.ArrayList(FileInfo), cutoff_ms: i64) void {
-    const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_path, rel_path }) catch return;
-    var dir = Io.Dir.openDirAbsolute(g_io, full_path, .{ .iterate = true }) catch |err| {
-        logOpendirError(full_path, err);
+fn scanDirRecursive(allocator: std.mem.Allocator, dir_path: []const u8, files: *std.ArrayList(FileInfo), cutoff_ms: i64) void {
+    var dir = Io.Dir.openDirAbsolute(g_io, dir_path, .{ .iterate = true }) catch |err| {
+        logOpendirError(dir_path, err);
         return;
     };
     defer dir.close(g_io);
 
+    // Reused for child paths each iteration. Safe across the recursive call
+    // because the callee finishes before we touch the buffer again.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var it = dir.iterate();
     while (it.next(g_io) catch null) |entry| {
         if (entry.kind == .directory) {
-            const sub_rel = std.fmt.allocPrint(allocator, "{s}/{s}", .{ rel_path, entry.name }) catch continue;
-            scanDirRecursive(allocator, base_path, sub_rel, files, cutoff_ms);
+            const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            scanDirRecursive(allocator, sub_path, files, cutoff_ms);
         } else if (entry.kind == .file and mem.endsWith(u8, entry.name, ".jsonl")) {
             const stat = dir.statFile(g_io, entry.name, .{}) catch continue;
 
             const mtime_ms: i64 = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms));
             if (mtime_ms < cutoff_ms) continue;
 
-            const abs_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ full_path, entry.name }) catch continue;
+            const abs_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
             files.append(allocator, .{ .path = abs_path, .size = @intCast(stat.size) }) catch continue;
         }
     }
@@ -452,6 +455,10 @@ fn readVal(comptime T: type, data: []const u8, pos: *usize) T {
     return result;
 }
 
+/// Parse on-disk cache bytes into a `CacheResult`. The returned
+/// `files[i].path` slices borrow from `content`; callers must keep
+/// `content` alive for as long as the result is used, and must not free
+/// `entry.path`.
 fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_ms: i64) ?CacheResult {
     if (content.len < cache_header_size) return null;
 
@@ -486,14 +493,14 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_
         };
     }
 
-    // Read file entries
     var files: std.ArrayList(CachedFileEntry) = .empty;
+    files.ensureTotalCapacityPrecise(allocator, file_count) catch {};
     var i: u32 = 0;
     while (i < file_count) : (i += 1) {
         if (pos + 2 > content.len) break;
         const path_len = readVal(u16, content, &pos);
         if (pos + path_len > content.len) break;
-        const path = allocator.dupe(u8, content[pos..][0..path_len]) catch break;
+        const path = content[pos..][0..path_len];
         pos += path_len;
         if (pos + 24 > content.len) break;
         const file_size = readVal(i64, content, &pos);
@@ -645,6 +652,7 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
 
     var block_diff_cost: f64 = 0;
     var new_files: std.ArrayList(CachedFileEntry) = .empty;
+    new_files.ensureTotalCapacityPrecise(allocator, cached.files.len) catch {};
     var global_seen: std.StringHashMapUnmanaged(void) = .empty;
 
     for (cached.files) |entry| {
@@ -721,6 +729,7 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
     const file_infos = collectTranscriptFiles(allocator, projects_path, now_ms);
     var all_entries: std.ArrayList(TranscriptEntry) = .empty;
     var cache_files: std.ArrayList(CachedFileEntry) = .empty;
+    cache_files.ensureTotalCapacityPrecise(allocator, file_infos.len) catch {};
     var total_today_cost: f64 = 0;
 
     var tmp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -924,10 +933,7 @@ test "cache roundtrip with block" {
 
     const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered(), day_start_ms) orelse
         return error.TestUnexpectedResult;
-    defer {
-        for (result.files) |f| std.testing.allocator.free(f.path);
-        std.testing.allocator.free(result.files);
-    }
+    defer std.testing.allocator.free(result.files);
 
     try std.testing.expectEqual(now_s, result.write_time_s);
     try std.testing.expectEqual(last_full_scan_s, result.last_full_scan_s);
@@ -1562,10 +1568,7 @@ test "cache partial file entries truncated" {
     const truncated_len = cache_header_size + 2 + "/tmp/f1.jsonl".len + 24 + 5;
     const result = parseCacheBytes(std.testing.allocator, full_data[0..truncated_len], day_start_ms) orelse
         return error.TestUnexpectedResult;
-    defer {
-        for (result.files) |f| std.testing.allocator.free(f.path);
-        std.testing.allocator.free(result.files);
-    }
+    defer std.testing.allocator.free(result.files);
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
 }
 
@@ -1583,10 +1586,7 @@ test "cache path length zero roundtrip" {
 
     const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered(), day_start_ms) orelse
         return error.TestUnexpectedResult;
-    defer {
-        for (result.files) |f| std.testing.allocator.free(f.path);
-        std.testing.allocator.free(result.files);
-    }
+    defer std.testing.allocator.free(result.files);
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
     try std.testing.expectEqualStrings("", result.files[0].path);
 }
