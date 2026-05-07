@@ -1,5 +1,4 @@
 const std = @import("std");
-const json = std.json;
 const mem = std.mem;
 const Io = std.Io;
 const pricing = @import("pricing.zig");
@@ -182,70 +181,222 @@ fn handleLine(
     parseJsonlLine(allocator, dedup_alloc, line, entries, seen) catch {};
 }
 
-/// Equivalent to `scanner.skipValue()` but byte-balances delimiters; faster
-/// on the assistant `content` array hot path.
-fn fastSkipValue(scanner: *json.Scanner) json.Scanner.SkipError!void {
-    const tt = scanner.peekNextTokenType() catch |err| switch (err) {
-        error.BufferUnderrun => unreachable,
-        else => |e| return e,
-    };
-    switch (tt) {
-        .object_begin, .array_begin => {
-            const input = scanner.input;
-            var i = scanner.cursor;
-            var depth: u32 = 0;
-            var in_string = false;
-            while (i < input.len) {
-                const c = input[i];
-                if (in_string) {
-                    if (c == '\\') {
-                        i += 2;
-                        continue;
-                    }
-                    if (c == '"') in_string = false;
-                } else switch (c) {
-                    '"' => in_string = true,
-                    '{', '[' => depth += 1,
-                    '}', ']' => {
-                        depth -= 1;
-                        if (depth == 0) {
-                            scanner.cursor = i + 1;
-                            scanner.state = .post_value;
-                            return;
-                        }
-                    },
-                    else => {},
-                }
-                i += 1;
-            }
-            return error.UnexpectedEndOfInput;
-        },
-        .string => {
-            const input = scanner.input;
-            var i = scanner.cursor + 1;
-            while (i < input.len) {
-                const c = input[i];
-                if (c == '\\') {
-                    i += 2;
-                    continue;
-                }
-                if (c == '"') {
-                    scanner.cursor = i + 1;
-                    scanner.state = .post_value;
-                    return;
-                }
-                i += 1;
-            }
-            return error.UnexpectedEndOfInput;
-        },
-        .number, .true, .false, .null => return scanner.skipValue(),
-        .object_end, .array_end, .end_of_document => unreachable,
+/// Hand-rolled SAX-style scanner for Claude transcript JSONL. Replaces
+/// `std.json.Scanner` to bypass DFA tokenization, allocator plumbing, and
+/// escape decoding; we only need fixed ASCII keys and raw byte values.
+///
+/// Schema assumptions (see `bench/CANDIDATES.md` (12)):
+/// - Object keys are ASCII without escapes, so a key boundary is the next `"`.
+/// - String values are returned as raw byte slices; escape sequences are not
+///   decoded. Boundary detection treats `\<any>` as a 2-byte advance, which
+///   is sufficient for `\"` and `\\` — Anthropic transcripts do not use
+///   `\uXXXX` for byte 0x22.
+const SaxScanner = struct {
+    input: []const u8,
+    cursor: usize,
+
+    fn init(input: []const u8) SaxScanner {
+        return .{ .input = input, .cursor = 0 };
     }
-}
+
+    inline fn skipWs(self: *SaxScanner) void {
+        while (self.cursor < self.input.len) : (self.cursor += 1) {
+            const c = self.input[self.cursor];
+            if (c != ' ' and c != '\t' and c != '\r' and c != '\n') return;
+        }
+    }
+
+    /// Consumes `{` if next, else skips the entire value. Returns true when
+    /// the caller should proceed to read keys.
+    fn enterObject(self: *SaxScanner) !bool {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        if (self.input[self.cursor] != '{') {
+            try self.skipValue();
+            return false;
+        }
+        self.cursor += 1;
+        return true;
+    }
+
+    /// Returns the next object key as an inner slice (no quotes), or null at
+    /// `}`. Consumes the trailing `:`. Keys are ASCII-only by schema, so we
+    /// scan for the closing `"` directly without escape tracking.
+    fn nextKey(self: *SaxScanner) !?[]const u8 {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        const c = self.input[self.cursor];
+        if (c == '}') {
+            self.cursor += 1;
+            return null;
+        }
+        if (c == ',') {
+            self.cursor += 1;
+            self.skipWs();
+        }
+        if (self.cursor >= self.input.len or self.input[self.cursor] != '"')
+            return error.UnexpectedToken;
+        self.cursor += 1;
+        const end = mem.indexOfScalarPos(u8, self.input, self.cursor, '"') orelse
+            return error.UnexpectedEndOfInput;
+        const key = self.input[self.cursor..end];
+        self.cursor = end + 1;
+        self.skipWs();
+        if (self.cursor >= self.input.len or self.input[self.cursor] != ':')
+            return error.UnexpectedToken;
+        self.cursor += 1;
+        return key;
+    }
+
+    /// Reads the next value as a raw byte slice (no unescaping). Skips and
+    /// returns null for non-strings, matching the previous parser's contract.
+    fn readString(self: *SaxScanner) !?[]const u8 {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        if (self.input[self.cursor] != '"') {
+            try self.skipValue();
+            return null;
+        }
+        self.cursor += 1;
+        const start = self.cursor;
+        const end = try self.scanStringEnd();
+        return self.input[start..end];
+    }
+
+    /// Scans from the current cursor (positioned just after the opening `"`)
+    /// to the closing `"`, treating `\<any>` as a 2-byte escape. Returns the
+    /// index of the closing quote (exclusive of), and advances cursor one
+    /// past it. Centralizes escape handling so `readString` and `skipValue`
+    /// can share a single source of truth.
+    inline fn scanStringEnd(self: *SaxScanner) !usize {
+        while (self.cursor < self.input.len) {
+            const c = self.input[self.cursor];
+            if (c == '\\') {
+                self.cursor += 2;
+                continue;
+            }
+            if (c == '"') {
+                const end = self.cursor;
+                self.cursor += 1;
+                return end;
+            }
+            self.cursor += 1;
+        }
+        return error.UnexpectedEndOfInput;
+    }
+
+    /// Reads the next value as an i64. Skips and returns 0 for non-numbers.
+    /// Hot path: 1–18 digit unsigned integer parsed inline (token counts
+    /// fit comfortably). Anything wider, signed, or with `.eE` falls through
+    /// to `readI64Slow` which preserves the previous parseInt+parseFloat
+    /// behavior.
+    fn readI64(self: *SaxScanner) !i64 {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        const c = self.input[self.cursor];
+        if (c < '0' or c > '9') {
+            if (c != '-') {
+                try self.skipValue();
+                return 0;
+            }
+            return self.readI64Slow();
+        }
+
+        const start = self.cursor;
+        var v: i64 = 0;
+        // Cap at 18 digits so the running `v * 10 + d` cannot overflow i64
+        // (max is 10^19 - 1 ≈ 9.22 × 10^18). 19+ digit numbers fall through
+        // to the slow path for exact handling.
+        while (self.cursor < self.input.len and self.cursor - start < 18) {
+            const d = self.input[self.cursor];
+            if (d < '0' or d > '9') break;
+            v = v * 10 + @as(i64, d - '0');
+            self.cursor += 1;
+        }
+        if (self.cursor < self.input.len) {
+            const next = self.input[self.cursor];
+            // 19th digit or float syntax — defer to slow path for full accuracy.
+            if ((next >= '0' and next <= '9') or next == '.' or next == 'e' or next == 'E') {
+                self.cursor = start;
+                return self.readI64Slow();
+            }
+        }
+        return v;
+    }
+
+    /// Slow path for negatives, floats, and 19+ digit numbers. Returns 0 on
+    /// any parse failure rather than propagating an error: a wrong token
+    /// count is preferable to silently dropping the entire transcript entry,
+    /// and Anthropic transcripts never produce malformed numerics in practice.
+    fn readI64Slow(self: *SaxScanner) i64 {
+        const start = self.cursor;
+        if (self.cursor < self.input.len and self.input[self.cursor] == '-')
+            self.cursor += 1;
+        while (self.cursor < self.input.len) : (self.cursor += 1) {
+            const d = self.input[self.cursor];
+            const is_digit = d >= '0' and d <= '9';
+            if (!is_digit and d != '.' and d != 'e' and d != 'E' and d != '+' and d != '-') break;
+        }
+        const slice = self.input[start..self.cursor];
+        if (std.fmt.parseInt(i64, slice, 10)) |v| return v else |_| {}
+        if (std.fmt.parseFloat(f64, slice)) |f| return @intFromFloat(f) else |_| {}
+        return 0;
+    }
+
+    /// Skips any JSON value (string, number, object, array, literal).
+    /// Object/array depth is tracked with a brace counter that respects
+    /// quoted strings; `\<any>` is a 2-byte advance, sufficient for `\"`.
+    fn skipValue(self: *SaxScanner) !void {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        switch (self.input[self.cursor]) {
+            '{', '[' => {
+                // The first iteration matches `{`/`[` (per outer switch) and
+                // raises depth to 1. The matching close drops depth back to 0
+                // and returns immediately, so depth never underflows here.
+                var depth: u32 = 0;
+                var in_string = false;
+                while (self.cursor < self.input.len) : (self.cursor += 1) {
+                    const c = self.input[self.cursor];
+                    if (in_string) {
+                        if (c == '\\') {
+                            self.cursor += 1;
+                            continue;
+                        }
+                        if (c == '"') in_string = false;
+                    } else switch (c) {
+                        '"' => in_string = true,
+                        '{', '[' => depth += 1,
+                        '}', ']' => {
+                            depth -= 1;
+                            if (depth == 0) {
+                                self.cursor += 1;
+                                return;
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                return error.UnexpectedEndOfInput;
+            },
+            '"' => {
+                self.cursor += 1;
+                _ = try self.scanStringEnd();
+            },
+            else => {
+                // number, true, false, null — scan to delimiter.
+                while (self.cursor < self.input.len) : (self.cursor += 1) {
+                    const c = self.input[self.cursor];
+                    if (c == ',' or c == '}' or c == ']' or
+                        c == ' ' or c == '\t' or c == '\r' or c == '\n') return;
+                }
+            },
+        }
+    }
+};
 
 const Parser = struct {
-    scanner: json.Scanner,
-    allocator: std.mem.Allocator,
+    scanner: SaxScanner,
     timestamp_str: ?[]const u8 = null,
     msg_id: ?[]const u8 = null,
     req_id: ?[]const u8 = null,
@@ -262,136 +413,78 @@ const Parser = struct {
     have_nested_cc: bool = false,
     is_fast: bool = false,
 
-    fn init(allocator: std.mem.Allocator, line: []const u8) Parser {
-        return .{
-            .scanner = json.Scanner.initCompleteInput(allocator, line),
-            .allocator = allocator,
-        };
-    }
-
-    fn deinit(self: *Parser) void {
-        self.scanner.deinit();
-    }
-
-    /// Consumes `object_begin` if next, else skips the value entirely.
-    /// Returns true when the caller should proceed to read keys.
-    fn enterObject(self: *Parser) !bool {
-        if ((try self.scanner.peekNextTokenType()) != .object_begin) {
-            try fastSkipValue(&self.scanner);
-            return false;
-        }
-        _ = try self.scanner.next();
-        return true;
-    }
-
-    /// Returns the next object key as a slice, or null at `object_end`.
-    /// Errors on unexpected tokens (malformed JSON).
-    fn nextKey(self: *Parser) !?[]const u8 {
-        const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
-        return switch (tok) {
-            .object_end => null,
-            .string, .allocated_string => |s| s,
-            else => error.UnexpectedToken,
-        };
-    }
-
-    /// Reads the next value as a string. Skips and returns null for non-strings.
-    fn readString(self: *Parser) !?[]const u8 {
-        if ((try self.scanner.peekNextTokenType()) != .string) {
-            try fastSkipValue(&self.scanner);
-            return null;
-        }
-        const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
-        return switch (tok) {
-            .string, .allocated_string => |s| s,
-            else => null,
-        };
-    }
-
-    /// Reads the next value as an i64. Truncates floats. Skips and returns 0 for non-numbers.
-    fn readI64(self: *Parser) !i64 {
-        if ((try self.scanner.peekNextTokenType()) != .number) {
-            try fastSkipValue(&self.scanner);
-            return 0;
-        }
-        const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
-        const slice = switch (tok) {
-            .number, .allocated_number => |s| s,
-            else => return 0,
-        };
-        if (std.fmt.parseInt(i64, slice, 10)) |v| return v else |_| {}
-        if (std.fmt.parseFloat(f64, slice)) |f| return @intFromFloat(f) else |_| {}
-        return 0;
+    fn init(line: []const u8) Parser {
+        return .{ .scanner = SaxScanner.init(line) };
     }
 
     fn parseTopLevel(self: *Parser) !void {
-        while (try self.nextKey()) |key| {
+        while (try self.scanner.nextKey()) |key| {
             if (mem.eql(u8, key, "timestamp")) {
-                self.timestamp_str = try self.readString();
+                self.timestamp_str = try self.scanner.readString();
             } else if (mem.eql(u8, key, "requestId")) {
-                self.req_id = try self.readString();
+                self.req_id = try self.scanner.readString();
             } else if (mem.eql(u8, key, "message")) {
                 try self.parseMessage();
             } else {
-                try fastSkipValue(&self.scanner);
+                try self.scanner.skipValue();
             }
         }
     }
 
     fn parseMessage(self: *Parser) !void {
-        if (!try self.enterObject()) return;
-        while (try self.nextKey()) |key| {
+        if (!try self.scanner.enterObject()) return;
+        while (try self.scanner.nextKey()) |key| {
             if (mem.eql(u8, key, "id")) {
-                self.msg_id = try self.readString();
+                self.msg_id = try self.scanner.readString();
             } else if (mem.eql(u8, key, "model")) {
-                if (try self.readString()) |m| self.model = m;
+                if (try self.scanner.readString()) |m| self.model = m;
             } else if (mem.eql(u8, key, "usage")) {
                 try self.parseUsage();
             } else {
-                try fastSkipValue(&self.scanner);
+                try self.scanner.skipValue();
             }
         }
     }
 
     fn parseUsage(self: *Parser) !void {
-        if (!try self.enterObject()) return;
+        if (!try self.scanner.enterObject()) return;
         self.have_usage = true;
-        while (try self.nextKey()) |key| {
+        while (try self.scanner.nextKey()) |key| {
             if (mem.eql(u8, key, "input_tokens")) {
-                self.input_tokens = try self.readI64();
+                self.input_tokens = try self.scanner.readI64();
             } else if (mem.eql(u8, key, "output_tokens")) {
-                self.output_tokens = try self.readI64();
+                self.output_tokens = try self.scanner.readI64();
             } else if (mem.eql(u8, key, "cache_read_input_tokens")) {
-                self.cache_read = try self.readI64();
+                self.cache_read = try self.scanner.readI64();
             } else if (mem.eql(u8, key, "cache_creation_input_tokens")) {
-                const v = try self.readI64();
+                const v = try self.scanner.readI64();
                 if (!self.have_nested_cc) self.cc_5m = v;
             } else if (mem.eql(u8, key, "speed")) {
-                const s = try self.readString();
+                const s = try self.scanner.readString();
                 self.is_fast = if (s) |v| mem.eql(u8, v, "fast") else false;
             } else if (mem.eql(u8, key, "cache_creation")) {
                 try self.parseCacheCreation();
             } else {
-                try fastSkipValue(&self.scanner);
+                try self.scanner.skipValue();
             }
         }
     }
 
     fn parseCacheCreation(self: *Parser) !void {
-        if (!try self.enterObject()) return;
+        if (!try self.scanner.enterObject()) return;
         self.have_nested_cc = true;
         // Nested values authoritatively replace any aggregate fallback already
         // captured in this usage object (key order between aggregate and nested
         // is not guaranteed by the schema).
         self.cc_5m = 0;
         self.cc_1h = 0;
-        while (try self.nextKey()) |key| {
+        while (try self.scanner.nextKey()) |key| {
             if (mem.eql(u8, key, "ephemeral_5m_input_tokens")) {
-                self.cc_5m = try self.readI64();
+                self.cc_5m = try self.scanner.readI64();
             } else if (mem.eql(u8, key, "ephemeral_1h_input_tokens")) {
-                self.cc_1h = try self.readI64();
+                self.cc_1h = try self.scanner.readI64();
             } else {
-                try fastSkipValue(&self.scanner);
+                try self.scanner.skipValue();
             }
         }
     }
@@ -404,10 +497,8 @@ fn parseJsonlLine(
     entries: *std.ArrayList(TranscriptEntry),
     seen: *std.StringHashMapUnmanaged(void),
 ) !void {
-    var p = Parser.init(allocator, line);
-    defer p.deinit();
-
-    if ((try p.scanner.next()) != .object_begin) return error.NotObject;
+    var p = Parser.init(line);
+    if (!try p.scanner.enterObject()) return;
     try p.parseTopLevel();
 
     // Order matches the previous DOM-based parser: dedup runs before
@@ -1841,72 +1932,42 @@ test "cache path length zero roundtrip" {
     try std.testing.expectEqualStrings("", result.files[0].path);
 }
 
-// --- fastSkipValue direct tests ---
+// --- SaxScanner direct tests ---
 
-fn skipAtKey(scanner: *json.Scanner, allocator: std.mem.Allocator, key: []const u8) !void {
-    try std.testing.expectEqual(json.Token.object_begin, try scanner.next());
-    const tok = try scanner.nextAlloc(allocator, .alloc_if_needed);
-    switch (tok) {
-        .string, .allocated_string => |s| try std.testing.expectEqualStrings(key, s),
-        else => return error.TestUnexpectedResult,
-    }
-    try fastSkipValue(scanner);
+fn skipAtKey(scanner: *SaxScanner, key: []const u8) !void {
+    if (!try scanner.enterObject()) return error.TestUnexpectedResult;
+    const k = (try scanner.nextKey()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(key, k);
+    try scanner.skipValue();
 }
 
-test "fastSkipValue skips nested object" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+test "SaxScanner skipValue skips nested object" {
     const input = "{\"k\":{\"a\":{\"b\":1}},\"next\":2}";
-    var scanner = json.Scanner.initCompleteInput(alloc, input);
-    defer scanner.deinit();
-
-    try skipAtKey(&scanner, alloc, "k");
-    const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
-    switch (tok) {
-        .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
-        else => return error.TestUnexpectedResult,
-    }
+    var scanner = SaxScanner.init(input);
+    try skipAtKey(&scanner, "k");
+    const k = (try scanner.nextKey()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("next", k);
 }
 
-test "fastSkipValue skips array containing braces inside strings" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+test "SaxScanner skipValue skips array containing braces inside strings" {
     // `}` and `]` inside the strings must NOT count toward depth — a naive
     // byte counter regresses here.
     const input = "{\"k\":[\"a}b\",\"c]d\",\"e\\\"f\"],\"next\":1}";
-    var scanner = json.Scanner.initCompleteInput(alloc, input);
-    defer scanner.deinit();
-
-    try skipAtKey(&scanner, alloc, "k");
-    const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
-    switch (tok) {
-        .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
-        else => return error.TestUnexpectedResult,
-    }
+    var scanner = SaxScanner.init(input);
+    try skipAtKey(&scanner, "k");
+    const k = (try scanner.nextKey()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("next", k);
 }
 
-test "fastSkipValue skips string with escaped quote" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+test "SaxScanner skipValue skips string with escaped quote" {
     const input = "{\"k\":\"a\\\"b\\\\\",\"next\":1}";
-    var scanner = json.Scanner.initCompleteInput(alloc, input);
-    defer scanner.deinit();
-
-    try skipAtKey(&scanner, alloc, "k");
-    const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
-    switch (tok) {
-        .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
-        else => return error.TestUnexpectedResult,
-    }
+    var scanner = SaxScanner.init(input);
+    try skipAtKey(&scanner, "k");
+    const k = (try scanner.nextKey()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("next", k);
 }
 
-test "fastSkipValue skips number, true, false, null via fallback" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+test "SaxScanner skipValue skips number, true, false, null" {
     const cases = [_][]const u8{
         "{\"k\":-1.5e10,\"next\":1}",
         "{\"k\":true,\"next\":1}",
@@ -1914,24 +1975,58 @@ test "fastSkipValue skips number, true, false, null via fallback" {
         "{\"k\":null,\"next\":1}",
     };
     for (cases) |input| {
-        var scanner = json.Scanner.initCompleteInput(alloc, input);
-        defer scanner.deinit();
-        try skipAtKey(&scanner, alloc, "k");
-        const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
-        switch (tok) {
-            .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
-            else => return error.TestUnexpectedResult,
-        }
+        var scanner = SaxScanner.init(input);
+        try skipAtKey(&scanner, "k");
+        const k = (try scanner.nextKey()) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("next", k);
     }
 }
 
-test "fastSkipValue unterminated value returns error" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var scanner = json.Scanner.initCompleteInput(alloc, "{\"k\":[1,2,3");
-    defer scanner.deinit();
-    try std.testing.expectError(error.UnexpectedEndOfInput, skipAtKey(&scanner, alloc, "k"));
+test "SaxScanner skipValue unterminated object returns error" {
+    var scanner = SaxScanner.init("{\"k\":[1,2,3");
+    try std.testing.expectError(error.UnexpectedEndOfInput, skipAtKey(&scanner, "k"));
+}
+
+test "SaxScanner readI64 fast path for unsigned integers" {
+    const cases = [_]struct { input: []const u8, want: i64 }{
+        .{ .input = "{\"k\":0}", .want = 0 },
+        .{ .input = "{\"k\":1234}", .want = 1234 },
+        .{ .input = "{\"k\":99999999}", .want = 99999999 },
+        // 18 digits — fast path upper bound.
+        .{ .input = "{\"k\":123456789012345678}", .want = 123456789012345678 },
+    };
+    for (cases) |c| {
+        var scanner = SaxScanner.init(c.input);
+        _ = try scanner.enterObject();
+        _ = try scanner.nextKey();
+        try std.testing.expectEqual(c.want, try scanner.readI64());
+    }
+}
+
+test "SaxScanner readI64 slow path for negatives, floats, 19+ digits" {
+    const cases = [_]struct { input: []const u8, want: i64 }{
+        .{ .input = "{\"k\":-1234}", .want = -1234 },
+        // Truncated, matching the previous parser's parseFloat fallback.
+        .{ .input = "{\"k\":12.5}", .want = 12 },
+        .{ .input = "{\"k\":1e3}", .want = 1000 },
+        // 19-digit i64 max.
+        .{ .input = "{\"k\":9223372036854775807}", .want = std.math.maxInt(i64) },
+    };
+    for (cases) |c| {
+        var scanner = SaxScanner.init(c.input);
+        _ = try scanner.enterObject();
+        _ = try scanner.nextKey();
+        try std.testing.expectEqual(c.want, try scanner.readI64());
+    }
+}
+
+test "SaxScanner readString returns raw escaped bytes" {
+    var scanner = SaxScanner.init("{\"k\":\"a\\\"b\"}");
+    _ = try scanner.enterObject();
+    _ = try scanner.nextKey();
+    const s = (try scanner.readString()) orelse return error.TestUnexpectedResult;
+    // Escapes are preserved verbatim — no decoding.
+    try std.testing.expectEqualStrings("a\\\"b", s);
 }
 
 // --- realistic transcript schema integration ---
@@ -1950,4 +2045,83 @@ test "parseJsonlContent realistic Claude schema with content array" {
     try std.testing.expectEqual(@as(usize, 1), entries.items.len);
     try std.testing.expectEqual(@as(i64, 1234), entries.items[0].usage.input_tokens);
     try std.testing.expectEqual(@as(i64, 567), entries.items[0].usage.output_tokens);
+}
+
+// --- golden table: regression gate for the SaxScanner replacement ---
+
+test "parseJsonlContent golden table" {
+    const Want = struct {
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_read: i64,
+        cc_5m: i64,
+        cc_1h: i64,
+        is_fast: bool,
+        model: []const u8,
+    };
+    const Case = struct { line: []const u8, want: Want };
+
+    const cases = [_]Case{
+        // Standard usage with aggregate cache_creation only.
+        .{
+            .line =
+            \\{"timestamp":"2025-05-08T12:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-sonnet-4-5","usage":{"input_tokens":150,"output_tokens":80,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+            ,
+            .want = .{ .input_tokens = 150, .output_tokens = 80, .cache_read = 0, .cc_5m = 0, .cc_1h = 0, .is_fast = false, .model = "claude-sonnet-4-5" },
+        },
+        // Premium usage with non-zero cache_read and aggregate cc_5m.
+        .{
+            .line =
+            \\{"timestamp":"2025-05-08T12:00:00Z","requestId":"r2","message":{"id":"m2","model":"claude-opus-4","usage":{"input_tokens":180000,"output_tokens":1200,"cache_creation_input_tokens":30000,"cache_read_input_tokens":10000}}}
+            ,
+            .want = .{ .input_tokens = 180000, .output_tokens = 1200, .cache_read = 10000, .cc_5m = 30000, .cc_1h = 0, .is_fast = false, .model = "claude-opus-4" },
+        },
+        // Speed=fast flag.
+        .{
+            .line =
+            \\{"timestamp":"2025-05-08T12:00:00Z","requestId":"r3","message":{"id":"m3","model":"claude-haiku-4-5-20250929","usage":{"input_tokens":10,"output_tokens":5,"speed":"fast","cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+            ,
+            .want = .{ .input_tokens = 10, .output_tokens = 5, .cache_read = 0, .cc_5m = 0, .cc_1h = 0, .is_fast = true, .model = "claude-haiku-4-5" },
+        },
+        // Nested cache_creation overrides aggregate fallback regardless of order.
+        .{
+            .line =
+            \\{"timestamp":"2025-05-08T12:00:00Z","requestId":"r4","message":{"id":"m4","model":"claude-sonnet-4-5","usage":{"cache_creation_input_tokens":99999,"input_tokens":50,"cache_creation":{"ephemeral_5m_input_tokens":700,"ephemeral_1h_input_tokens":300},"output_tokens":40}}}
+            ,
+            .want = .{ .input_tokens = 50, .output_tokens = 40, .cache_read = 0, .cc_5m = 700, .cc_1h = 300, .is_fast = false, .model = "claude-sonnet-4-5" },
+        },
+        // Nested cache_creation appears before aggregate — nested still wins.
+        .{
+            .line =
+            \\{"timestamp":"2025-05-08T12:00:00Z","requestId":"r5","message":{"id":"m5","model":"claude-sonnet-4-5","usage":{"cache_creation":{"ephemeral_5m_input_tokens":111,"ephemeral_1h_input_tokens":222},"cache_creation_input_tokens":99999,"input_tokens":1,"output_tokens":2}}}
+            ,
+            .want = .{ .input_tokens = 1, .output_tokens = 2, .cache_read = 0, .cc_5m = 111, .cc_1h = 222, .is_fast = false, .model = "claude-sonnet-4-5" },
+        },
+        // Top-level keys in an unusual order — message comes before timestamp.
+        .{
+            .line =
+            \\{"message":{"id":"m6","model":"claude-sonnet-4-5","usage":{"input_tokens":7,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"timestamp":"2025-05-08T12:00:00Z","requestId":"r6"}
+            ,
+            .want = .{ .input_tokens = 7, .output_tokens = 3, .cache_read = 0, .cc_5m = 0, .cc_1h = 0, .is_fast = false, .model = "claude-sonnet-4-5" },
+        },
+    };
+
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        var entries: std.ArrayList(TranscriptEntry) = .empty;
+        parseJsonlContent(alloc, alloc, c.line, &entries, &seen);
+
+        try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+        const e = entries.items[0];
+        try std.testing.expectEqual(c.want.input_tokens, e.usage.input_tokens);
+        try std.testing.expectEqual(c.want.output_tokens, e.usage.output_tokens);
+        try std.testing.expectEqual(c.want.cache_read, e.usage.cache_read_input_tokens);
+        try std.testing.expectEqual(c.want.cc_5m, e.usage.cache_creation_5m_input_tokens);
+        try std.testing.expectEqual(c.want.cc_1h, e.usage.cache_creation_1h_input_tokens);
+        try std.testing.expectEqual(c.want.is_fast, e.usage.is_fast);
+        try std.testing.expectEqualStrings(c.want.model, e.model);
+    }
 }
