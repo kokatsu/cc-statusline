@@ -182,6 +182,67 @@ fn handleLine(
     parseJsonlLine(allocator, dedup_alloc, line, entries, seen) catch {};
 }
 
+/// Equivalent to `scanner.skipValue()` but byte-balances delimiters; faster
+/// on the assistant `content` array hot path.
+fn fastSkipValue(scanner: *json.Scanner) json.Scanner.SkipError!void {
+    const tt = scanner.peekNextTokenType() catch |err| switch (err) {
+        error.BufferUnderrun => unreachable,
+        else => |e| return e,
+    };
+    switch (tt) {
+        .object_begin, .array_begin => {
+            const input = scanner.input;
+            var i = scanner.cursor;
+            var depth: u32 = 0;
+            var in_string = false;
+            while (i < input.len) {
+                const c = input[i];
+                if (in_string) {
+                    if (c == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (c == '"') in_string = false;
+                } else switch (c) {
+                    '"' => in_string = true,
+                    '{', '[' => depth += 1,
+                    '}', ']' => {
+                        depth -= 1;
+                        if (depth == 0) {
+                            scanner.cursor = i + 1;
+                            scanner.state = .post_value;
+                            return;
+                        }
+                    },
+                    else => {},
+                }
+                i += 1;
+            }
+            return error.UnexpectedEndOfInput;
+        },
+        .string => {
+            const input = scanner.input;
+            var i = scanner.cursor + 1;
+            while (i < input.len) {
+                const c = input[i];
+                if (c == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (c == '"') {
+                    scanner.cursor = i + 1;
+                    scanner.state = .post_value;
+                    return;
+                }
+                i += 1;
+            }
+            return error.UnexpectedEndOfInput;
+        },
+        .number, .true, .false, .null => return scanner.skipValue(),
+        .object_end, .array_end, .end_of_document => unreachable,
+    }
+}
+
 const Parser = struct {
     scanner: json.Scanner,
     allocator: std.mem.Allocator,
@@ -216,7 +277,7 @@ const Parser = struct {
     /// Returns true when the caller should proceed to read keys.
     fn enterObject(self: *Parser) !bool {
         if ((try self.scanner.peekNextTokenType()) != .object_begin) {
-            try self.scanner.skipValue();
+            try fastSkipValue(&self.scanner);
             return false;
         }
         _ = try self.scanner.next();
@@ -237,7 +298,7 @@ const Parser = struct {
     /// Reads the next value as a string. Skips and returns null for non-strings.
     fn readString(self: *Parser) !?[]const u8 {
         if ((try self.scanner.peekNextTokenType()) != .string) {
-            try self.scanner.skipValue();
+            try fastSkipValue(&self.scanner);
             return null;
         }
         const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
@@ -250,7 +311,7 @@ const Parser = struct {
     /// Reads the next value as an i64. Truncates floats. Skips and returns 0 for non-numbers.
     fn readI64(self: *Parser) !i64 {
         if ((try self.scanner.peekNextTokenType()) != .number) {
-            try self.scanner.skipValue();
+            try fastSkipValue(&self.scanner);
             return 0;
         }
         const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
@@ -272,7 +333,7 @@ const Parser = struct {
             } else if (mem.eql(u8, key, "message")) {
                 try self.parseMessage();
             } else {
-                try self.scanner.skipValue();
+                try fastSkipValue(&self.scanner);
             }
         }
     }
@@ -287,7 +348,7 @@ const Parser = struct {
             } else if (mem.eql(u8, key, "usage")) {
                 try self.parseUsage();
             } else {
-                try self.scanner.skipValue();
+                try fastSkipValue(&self.scanner);
             }
         }
     }
@@ -311,7 +372,7 @@ const Parser = struct {
             } else if (mem.eql(u8, key, "cache_creation")) {
                 try self.parseCacheCreation();
             } else {
-                try self.scanner.skipValue();
+                try fastSkipValue(&self.scanner);
             }
         }
     }
@@ -330,7 +391,7 @@ const Parser = struct {
             } else if (mem.eql(u8, key, "ephemeral_1h_input_tokens")) {
                 self.cc_1h = try self.readI64();
             } else {
-                try self.scanner.skipValue();
+                try fastSkipValue(&self.scanner);
             }
         }
     }
@@ -1778,4 +1839,115 @@ test "cache path length zero roundtrip" {
     defer std.testing.allocator.free(result.files);
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
     try std.testing.expectEqualStrings("", result.files[0].path);
+}
+
+// --- fastSkipValue direct tests ---
+
+fn skipAtKey(scanner: *json.Scanner, allocator: std.mem.Allocator, key: []const u8) !void {
+    try std.testing.expectEqual(json.Token.object_begin, try scanner.next());
+    const tok = try scanner.nextAlloc(allocator, .alloc_if_needed);
+    switch (tok) {
+        .string, .allocated_string => |s| try std.testing.expectEqualStrings(key, s),
+        else => return error.TestUnexpectedResult,
+    }
+    try fastSkipValue(scanner);
+}
+
+test "fastSkipValue skips nested object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const input = "{\"k\":{\"a\":{\"b\":1}},\"next\":2}";
+    var scanner = json.Scanner.initCompleteInput(alloc, input);
+    defer scanner.deinit();
+
+    try skipAtKey(&scanner, alloc, "k");
+    const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
+    switch (tok) {
+        .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fastSkipValue skips array containing braces inside strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    // `}` and `]` inside the strings must NOT count toward depth — a naive
+    // byte counter regresses here.
+    const input = "{\"k\":[\"a}b\",\"c]d\",\"e\\\"f\"],\"next\":1}";
+    var scanner = json.Scanner.initCompleteInput(alloc, input);
+    defer scanner.deinit();
+
+    try skipAtKey(&scanner, alloc, "k");
+    const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
+    switch (tok) {
+        .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fastSkipValue skips string with escaped quote" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const input = "{\"k\":\"a\\\"b\\\\\",\"next\":1}";
+    var scanner = json.Scanner.initCompleteInput(alloc, input);
+    defer scanner.deinit();
+
+    try skipAtKey(&scanner, alloc, "k");
+    const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
+    switch (tok) {
+        .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "fastSkipValue skips number, true, false, null via fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cases = [_][]const u8{
+        "{\"k\":-1.5e10,\"next\":1}",
+        "{\"k\":true,\"next\":1}",
+        "{\"k\":false,\"next\":1}",
+        "{\"k\":null,\"next\":1}",
+    };
+    for (cases) |input| {
+        var scanner = json.Scanner.initCompleteInput(alloc, input);
+        defer scanner.deinit();
+        try skipAtKey(&scanner, alloc, "k");
+        const tok = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        switch (tok) {
+            .string, .allocated_string => |s| try std.testing.expectEqualStrings("next", s),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "fastSkipValue unterminated value returns error" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var scanner = json.Scanner.initCompleteInput(alloc, "{\"k\":[1,2,3");
+    defer scanner.deinit();
+    try std.testing.expectError(error.UnexpectedEndOfInput, skipAtKey(&scanner, alloc, "k"));
+}
+
+// --- realistic transcript schema integration ---
+
+test "parseJsonlContent realistic Claude schema with content array" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"parentUuid":"par-1","isSidechain":false,"userType":"external","cwd":"/tmp","sessionId":"ses-1","version":"2.0.0","type":"assistant","uuid":"uid-1","timestamp":"2025-06-15T10:00:00Z","requestId":"req-1","message":{"id":"msg-1","type":"message","role":"assistant","model":"claude-sonnet-4-5-20250929","content":[{"type":"text","text":"hello with } and ] and \"quoted\""},{"type":"tool_use","id":"toolu-1","name":"Edit","input":{"path":"/x","old":"a","new":"b"}}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1234,"output_tokens":567,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqual(@as(i64, 1234), entries.items[0].usage.input_tokens);
+    try std.testing.expectEqual(@as(i64, 567), entries.items[0].usage.output_tokens);
 }
