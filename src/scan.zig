@@ -5,8 +5,6 @@ const Io = std.Io;
 const pricing = @import("pricing.zig");
 const time = @import("time.zig");
 const types = @import("types.zig");
-const ju = @import("json_util.zig");
-
 // Module-level io handle: cc-statusline is single-threaded and scanning touches
 // dozens of callsites, so threading io through every helper balloons the diff.
 var g_io: Io = undefined;
@@ -15,11 +13,6 @@ const ScanResult = types.ScanResult;
 const BlockInfo = types.BlockInfo;
 const ms_per_min = types.ms_per_min;
 const TokenUsage = pricing.TokenUsage;
-
-const getObj = ju.getObj;
-const getObjField = ju.getObjField;
-const getStr = ju.getStr;
-const getI64Field = ju.getI64Field;
 
 // ============================================================
 // Constants
@@ -142,64 +135,202 @@ pub fn parseJsonlContent(allocator: std.mem.Allocator, dedup_alloc: std.mem.Allo
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         if (mem.indexOf(u8, line, "\"input_tokens\"") == null) continue;
-
-        const parsed = json.parseFromSlice(json.Value, allocator, line, .{}) catch continue;
-        const root = getObj(parsed.value) orelse continue;
-
-        // Deduplication by messageId:requestId
-        const msg_id = if (getObjField(root, "message")) |mo|
-            (if (mo.get("id")) |id| getStr(id) else null)
-        else
-            null;
-        const req_id = if (root.get("requestId")) |v| getStr(v) else null;
-        if (msg_id != null and req_id != null) {
-            const dedup_key = std.fmt.allocPrint(dedup_alloc, "{s}:{s}", .{ msg_id.?, req_id.? }) catch continue;
-            const gop = seen.getOrPut(dedup_alloc, dedup_key) catch continue;
-            if (gop.found_existing) continue;
-        }
-
-        const timestamp_str = blk: {
-            const v = root.get("timestamp") orelse continue;
-            break :blk getStr(v) orelse continue;
-        };
-        const timestamp_ms = time.parseIso8601ToMs(timestamp_str) orelse continue;
-
-        const msg = getObjField(root, "message") orelse continue;
-        const uobj = getObjField(msg, "usage") orelse continue;
-        const model_str = if (msg.get("model")) |v| (getStr(v) orelse "unknown") else "unknown";
-
-        const is_fast = if (uobj.get("speed")) |sv| blk: {
-            const s = getStr(sv) orelse break :blk false;
-            break :blk mem.eql(u8, s, "fast");
-        } else false;
-
-        // Prefer nested `cache_creation` object when present (splits 5m vs 1h writes).
-        // Fallback to the aggregate `cache_creation_input_tokens` (treated as 5m) for
-        // older transcripts that predate the nested breakdown.
-        var cc_5m: i64 = 0;
-        var cc_1h: i64 = 0;
-        if (getObjField(uobj, "cache_creation")) |cc| {
-            cc_5m = getI64Field(cc, "ephemeral_5m_input_tokens");
-            cc_1h = getI64Field(cc, "ephemeral_1h_input_tokens");
-        } else {
-            cc_5m = getI64Field(uobj, "cache_creation_input_tokens");
-        }
-
-        const usage = TokenUsage{
-            .input_tokens = getI64Field(uobj, "input_tokens"),
-            .output_tokens = getI64Field(uobj, "output_tokens"),
-            .cache_creation_5m_input_tokens = cc_5m,
-            .cache_creation_1h_input_tokens = cc_1h,
-            .cache_read_input_tokens = getI64Field(uobj, "cache_read_input_tokens"),
-            .is_fast = is_fast,
-        };
-
-        entries.append(allocator, .{
-            .timestamp_ms = timestamp_ms,
-            .model = model_str,
-            .usage = usage,
-        }) catch continue;
+        parseJsonlLine(allocator, dedup_alloc, line, entries, seen) catch continue;
     }
+}
+
+const Parser = struct {
+    scanner: json.Scanner,
+    allocator: std.mem.Allocator,
+    timestamp_str: ?[]const u8 = null,
+    msg_id: ?[]const u8 = null,
+    req_id: ?[]const u8 = null,
+    model: []const u8 = "unknown",
+    have_usage: bool = false,
+    input_tokens: i64 = 0,
+    output_tokens: i64 = 0,
+    cache_read: i64 = 0,
+    cc_5m: i64 = 0,
+    cc_1h: i64 = 0,
+    /// True once a nested `cache_creation` object is entered. Nested values
+    /// are authoritative, so the aggregate `cache_creation_input_tokens`
+    /// fallback is ignored once this is set, regardless of key order.
+    have_nested_cc: bool = false,
+    is_fast: bool = false,
+
+    fn init(allocator: std.mem.Allocator, line: []const u8) Parser {
+        return .{
+            .scanner = json.Scanner.initCompleteInput(allocator, line),
+            .allocator = allocator,
+        };
+    }
+
+    fn deinit(self: *Parser) void {
+        self.scanner.deinit();
+    }
+
+    /// Consumes `object_begin` if next, else skips the value entirely.
+    /// Returns true when the caller should proceed to read keys.
+    fn enterObject(self: *Parser) !bool {
+        if ((try self.scanner.peekNextTokenType()) != .object_begin) {
+            try self.scanner.skipValue();
+            return false;
+        }
+        _ = try self.scanner.next();
+        return true;
+    }
+
+    /// Returns the next object key as a slice, or null at `object_end`.
+    /// Errors on unexpected tokens (malformed JSON).
+    fn nextKey(self: *Parser) !?[]const u8 {
+        const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
+        return switch (tok) {
+            .object_end => null,
+            .string, .allocated_string => |s| s,
+            else => error.UnexpectedToken,
+        };
+    }
+
+    /// Reads the next value as a string. Skips and returns null for non-strings.
+    fn readString(self: *Parser) !?[]const u8 {
+        if ((try self.scanner.peekNextTokenType()) != .string) {
+            try self.scanner.skipValue();
+            return null;
+        }
+        const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
+        return switch (tok) {
+            .string, .allocated_string => |s| s,
+            else => null,
+        };
+    }
+
+    /// Reads the next value as an i64. Truncates floats. Skips and returns 0 for non-numbers.
+    fn readI64(self: *Parser) !i64 {
+        if ((try self.scanner.peekNextTokenType()) != .number) {
+            try self.scanner.skipValue();
+            return 0;
+        }
+        const tok = try self.scanner.nextAlloc(self.allocator, .alloc_if_needed);
+        const slice = switch (tok) {
+            .number, .allocated_number => |s| s,
+            else => return 0,
+        };
+        if (std.fmt.parseInt(i64, slice, 10)) |v| return v else |_| {}
+        if (std.fmt.parseFloat(f64, slice)) |f| return @intFromFloat(f) else |_| {}
+        return 0;
+    }
+
+    fn parseTopLevel(self: *Parser) !void {
+        while (try self.nextKey()) |key| {
+            if (mem.eql(u8, key, "timestamp")) {
+                self.timestamp_str = try self.readString();
+            } else if (mem.eql(u8, key, "requestId")) {
+                self.req_id = try self.readString();
+            } else if (mem.eql(u8, key, "message")) {
+                try self.parseMessage();
+            } else {
+                try self.scanner.skipValue();
+            }
+        }
+    }
+
+    fn parseMessage(self: *Parser) !void {
+        if (!try self.enterObject()) return;
+        while (try self.nextKey()) |key| {
+            if (mem.eql(u8, key, "id")) {
+                self.msg_id = try self.readString();
+            } else if (mem.eql(u8, key, "model")) {
+                if (try self.readString()) |m| self.model = m;
+            } else if (mem.eql(u8, key, "usage")) {
+                try self.parseUsage();
+            } else {
+                try self.scanner.skipValue();
+            }
+        }
+    }
+
+    fn parseUsage(self: *Parser) !void {
+        if (!try self.enterObject()) return;
+        self.have_usage = true;
+        while (try self.nextKey()) |key| {
+            if (mem.eql(u8, key, "input_tokens")) {
+                self.input_tokens = try self.readI64();
+            } else if (mem.eql(u8, key, "output_tokens")) {
+                self.output_tokens = try self.readI64();
+            } else if (mem.eql(u8, key, "cache_read_input_tokens")) {
+                self.cache_read = try self.readI64();
+            } else if (mem.eql(u8, key, "cache_creation_input_tokens")) {
+                const v = try self.readI64();
+                if (!self.have_nested_cc) self.cc_5m = v;
+            } else if (mem.eql(u8, key, "speed")) {
+                const s = try self.readString();
+                self.is_fast = if (s) |v| mem.eql(u8, v, "fast") else false;
+            } else if (mem.eql(u8, key, "cache_creation")) {
+                try self.parseCacheCreation();
+            } else {
+                try self.scanner.skipValue();
+            }
+        }
+    }
+
+    fn parseCacheCreation(self: *Parser) !void {
+        if (!try self.enterObject()) return;
+        self.have_nested_cc = true;
+        // Nested values authoritatively replace any aggregate fallback already
+        // captured in this usage object (key order between aggregate and nested
+        // is not guaranteed by the schema).
+        self.cc_5m = 0;
+        self.cc_1h = 0;
+        while (try self.nextKey()) |key| {
+            if (mem.eql(u8, key, "ephemeral_5m_input_tokens")) {
+                self.cc_5m = try self.readI64();
+            } else if (mem.eql(u8, key, "ephemeral_1h_input_tokens")) {
+                self.cc_1h = try self.readI64();
+            } else {
+                try self.scanner.skipValue();
+            }
+        }
+    }
+};
+
+fn parseJsonlLine(
+    allocator: std.mem.Allocator,
+    dedup_alloc: std.mem.Allocator,
+    line: []const u8,
+    entries: *std.ArrayList(TranscriptEntry),
+    seen: *std.StringHashMapUnmanaged(void),
+) !void {
+    var p = Parser.init(allocator, line);
+    defer p.deinit();
+
+    if ((try p.scanner.next()) != .object_begin) return error.NotObject;
+    try p.parseTopLevel();
+
+    // Order matches the previous DOM-based parser: dedup runs before
+    // timestamp/usage validation, so a line with msg/req IDs but missing
+    // timestamp still claims its dedup key.
+    if (p.msg_id) |mid| if (p.req_id) |rid| {
+        const dedup_key = try std.fmt.allocPrint(dedup_alloc, "{s}:{s}", .{ mid, rid });
+        const gop = try seen.getOrPut(dedup_alloc, dedup_key);
+        if (gop.found_existing) return;
+    };
+
+    if (!p.have_usage) return;
+    const ts_str = p.timestamp_str orelse return;
+    const timestamp_ms = time.parseIso8601ToMs(ts_str) orelse return;
+
+    try entries.append(allocator, .{
+        .timestamp_ms = timestamp_ms,
+        .model = p.model,
+        .usage = .{
+            .input_tokens = p.input_tokens,
+            .output_tokens = p.output_tokens,
+            .cache_creation_5m_input_tokens = p.cc_5m,
+            .cache_creation_1h_input_tokens = p.cc_1h,
+            .cache_read_input_tokens = p.cache_read,
+            .is_fast = p.is_fast,
+        },
+    });
 }
 
 // ============================================================
