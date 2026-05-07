@@ -648,6 +648,110 @@ pub fn benchFullScan(io: Io, allocator: std.mem.Allocator, projects_path: []cons
     return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, null);
 }
 
+/// Phases of `benchFullScanProfiled`. Used as both a label source and an index
+/// into `PhaseTimings`, so adding a phase requires touching only one place.
+pub const Phase = enum {
+    collect,
+    open,
+    read_parse,
+    copy,
+    cost,
+    block,
+    write_cache,
+};
+
+pub const phase_count = std.meta.fields(Phase).len;
+
+/// Per-phase wall-clock budget for one fullScan invocation, indexed by `Phase`.
+/// Sums to ~total fullScan ns (modulo Clock.awake.now overhead, ~10-100 ns per probe).
+pub const PhaseTimings = [phase_count]u64;
+
+/// Bench-only profiled fullScan. Kept as a deliberate duplicate of `fullScan`
+/// rather than parametrising it with a comptime flag, to keep bench scaffolding
+/// out of the production hot path.
+pub fn benchFullScanProfiled(
+    io: Io,
+    allocator: std.mem.Allocator,
+    projects_path: []const u8,
+    now_ms: i64,
+    day_start_ms: i64,
+    timings: *PhaseTimings,
+) ScanResult {
+    g_io = io;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    @memset(timings, 0);
+
+    var ts = Io.Clock.awake.now(io);
+    const file_infos = collectTranscriptFiles(allocator, projects_path, now_ms);
+    timings[@intFromEnum(Phase.collect)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
+
+    var all_entries: std.ArrayList(TranscriptEntry) = .empty;
+    var cache_files: std.ArrayList(CachedFileEntry) = .empty;
+    cache_files.ensureTotalCapacityPrecise(allocator, file_infos.len) catch {};
+    var total_today_cost: f64 = 0;
+
+    var tmp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer tmp_arena.deinit();
+    var global_seen: std.StringHashMapUnmanaged(void) = .empty;
+
+    for (file_infos) |fi| {
+        _ = tmp_arena.reset(.retain_capacity);
+        const tmp = tmp_arena.allocator();
+
+        ts = Io.Clock.awake.now(io);
+        var f = Io.Dir.openFileAbsolute(io, fi.path, .{}) catch continue;
+        defer f.close(io);
+        var rbuf: [jsonl_buf_size]u8 = undefined;
+        var reader = f.readerStreaming(io, &rbuf);
+        timings[@intFromEnum(Phase.open)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+
+        ts = Io.Clock.awake.now(io);
+        var file_entries: std.ArrayList(TranscriptEntry) = .empty;
+        parseJsonlReader(tmp, allocator, &reader.interface, &file_entries, &global_seen);
+        timings[@intFromEnum(Phase.read_parse)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+
+        ts = Io.Clock.awake.now(io);
+        const start_idx = all_entries.items.len;
+        for (file_entries.items) |entry| {
+            all_entries.append(allocator, entry) catch continue;
+        }
+        timings[@intFromEnum(Phase.copy)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+
+        ts = Io.Clock.awake.now(io);
+        const new_items = all_entries.items[start_idx..];
+        var per_cost: f64 = 0;
+        for (new_items) |entry| {
+            if (entry.timestamp_ms >= day_start_ms) {
+                per_cost += entryCost(entry);
+            }
+        }
+        total_today_cost += per_cost;
+        // Bookkeeping inside `cost` so the seven phase counters cleanly
+        // sum to total fullScan ns.
+        cache_files.append(allocator, .{
+            .path = fi.path,
+            .file_size = fi.size,
+            .per_file_cost = per_cost,
+            .parsed_size = fi.size,
+        }) catch {};
+        timings[@intFromEnum(Phase.cost)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+    }
+
+    ts = Io.Clock.awake.now(io);
+    const result = ScanResult{
+        .today_cost = total_today_cost,
+        .block = computeBlock(all_entries.items, now_ms, null),
+    };
+    timings[@intFromEnum(Phase.block)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
+
+    ts = Io.Clock.awake.now(io);
+    const cf = cache_files.toOwnedSlice(allocator) catch &.{};
+    writeCache(result, cf, now_s, now_s, day_start_ms);
+    timings[@intFromEnum(Phase.write_cache)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
+
+    return result;
+}
+
 pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64) ?ScanResult {
     g_io = io;
     const config_dir = getConfigDir(allocator, env) catch return null;

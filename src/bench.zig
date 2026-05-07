@@ -350,6 +350,41 @@ fn benchFullScan(allocator: std.mem.Allocator, io: Io, projects_path: []const u8
     return computeStats(samples);
 }
 
+// ─── Phase profiling: per-phase median over fullScan iterations ───────────
+
+const PhaseStats = [scan.phase_count]Stats;
+
+fn benchFullScanProfiled(allocator: std.mem.Allocator, io: Io, projects_path: []const u8, now_ms: i64, day_start_ms: i64, iters: u32) !PhaseStats {
+    var samples: [scan.phase_count][]u64 = undefined;
+    var allocated: usize = 0;
+    // Register defer before the alloc loop so a partial failure still frees what landed.
+    defer for (samples[0..allocated]) |s| allocator.free(s);
+    for (&samples) |*s| {
+        s.* = try allocator.alloc(u64, iters);
+        allocated += 1;
+    }
+
+    var i: u32 = 0;
+    while (i < warmup_iters) : (i += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var t: scan.PhaseTimings = @splat(0);
+        _ = scan.benchFullScanProfiled(io, arena.allocator(), projects_path, now_ms, day_start_ms, &t);
+    }
+    i = 0;
+    while (i < iters) : (i += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var t: scan.PhaseTimings = @splat(0);
+        _ = scan.benchFullScanProfiled(io, arena.allocator(), projects_path, now_ms, day_start_ms, &t);
+        for (&samples, t) |*s, ns| s.*[i] = ns;
+    }
+
+    var out: PhaseStats = undefined;
+    for (&out, samples) |*o, s| o.* = computeStats(s);
+    return out;
+}
+
 // ─── Micro bench: parseJsonlContent on one file ───────────────────────────
 
 fn benchParseJsonl(allocator: std.mem.Allocator, io: Io, content: []const u8, iters: u32) !Stats {
@@ -387,6 +422,7 @@ const Result = struct {
     e2e_cold: Stats,
     e2e_warm: Stats,
     full_scan: Stats,
+    full_scan_phases: PhaseStats,
     parse_jsonl: Stats,
 
     fn toBaseline(self: Result) BaselineEntry {
@@ -423,7 +459,7 @@ inline fn pickBaseline(base: ?BaselineEntry, comptime field: []const u8) ?u64 {
     return if (base) |b| @field(b, field) else null;
 }
 
-fn writeRow(w: *Io.Writer, label: []const u8, s: Stats, base_median: ?u64) !void {
+fn writeStatsCells(w: *Io.Writer, label: []const u8, s: Stats) !void {
     var b1: [32]u8 = undefined;
     var b2: [32]u8 = undefined;
     var b3: [32]u8 = undefined;
@@ -433,6 +469,10 @@ fn writeRow(w: *Io.Writer, label: []const u8, s: Stats, base_median: ?u64) !void
         fmtNs(&b2, s.min_ns),
         fmtNs(&b3, s.p99_ns),
     });
+}
+
+fn writeRow(w: *Io.Writer, label: []const u8, s: Stats, base_median: ?u64) !void {
+    try writeStatsCells(w, label, s);
     if (diffPct(s.median_ns, base_median)) |p| {
         const sign = if (p >= 0) "+" else "";
         try w.print("   [{s}{d:.1}% vs baseline]", .{ sign, p });
@@ -462,7 +502,40 @@ fn printResults(w: *Io.Writer, results: []const Result, baseline: ?BaselineMap) 
         try writeRow(w, "fullScan", r.full_scan, pickBaseline(base, "full_scan"));
         try writeRow(w, "parseJsonlContent", r.parse_jsonl, pickBaseline(base, "parse_jsonl"));
         try w.writeAll("\n");
+
+        try printPhaseBreakdown(w, r.full_scan, r.full_scan_phases);
+        try w.writeAll("\n");
     }
+}
+
+fn phaseLabel(p: scan.Phase) []const u8 {
+    return switch (p) {
+        .collect => "collectFiles",
+        .open => "open+reader",
+        .read_parse => "read+parse",
+        .copy => "entry copy",
+        .cost => "today cost sum",
+        .block => "computeBlock",
+        .write_cache => "writeCache",
+    };
+}
+
+fn printPhaseBreakdown(w: *Io.Writer, total: Stats, p: PhaseStats) !void {
+    try w.writeAll("    fullScan phase breakdown (median)\n");
+    try w.writeAll("    ────────────────────────────────────────────────────────────\n");
+    inline for (std.meta.fields(scan.Phase)) |f| {
+        const phase: scan.Phase = @enumFromInt(f.value);
+        try writePhaseRow(w, phaseLabel(phase), p[f.value], total.median_ns);
+    }
+}
+
+fn writePhaseRow(w: *Io.Writer, label: []const u8, s: Stats, total_median_ns: u64) !void {
+    try writeStatsCells(w, label, s);
+    if (total_median_ns > 0) {
+        const pct = @as(f64, @floatFromInt(s.median_ns)) * 100.0 / @as(f64, @floatFromInt(total_median_ns));
+        try w.print("   [{d: >5.1}% of fullScan]", .{pct});
+    }
+    try w.writeAll("\n");
 }
 
 // ─── Baseline JSON ────────────────────────────────────────────────────────
@@ -614,6 +687,7 @@ pub fn main(init: std.process.Init) !void {
         const e2e_cold = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .cold, default_iters);
         const e2e_warm = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .warm, default_iters);
         const fs_stats = try benchFullScan(allocator, io, projects_path, now_ms, day_start_ms, default_iters);
+        const fs_phases = try benchFullScanProfiled(allocator, io, projects_path, now_ms, day_start_ms, default_iters);
         const pj_stats = try benchParseJsonl(allocator, io, content, default_iters);
 
         try results.append(allocator, .{
@@ -624,6 +698,7 @@ pub fn main(init: std.process.Init) !void {
             .e2e_cold = e2e_cold,
             .e2e_warm = e2e_warm,
             .full_scan = fs_stats,
+            .full_scan_phases = fs_phases,
             .parse_jsonl = pj_stats,
         });
     }
