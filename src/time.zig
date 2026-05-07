@@ -13,6 +13,8 @@ pub fn formatLocalDateTime(buf: []u8, epoch_ms: i64, utc_offset_s: i32) []const 
 // ============================================================
 
 pub fn parseIso8601ToMs(s: []const u8) ?i64 {
+    if (parseIso8601FastCanonical(s)) |ms| return ms;
+
     if (s.len < 19) return null;
     if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') return null;
 
@@ -36,6 +38,37 @@ pub fn parseIso8601ToMs(s: []const u8) ?i64 {
     const days = daysFromCivil(@intCast(year), @intCast(month), @intCast(day));
     const epoch_s = days * 86400 + @as(i64, @intCast(hour)) * 3600 + @as(i64, @intCast(minute)) * 60 + @as(i64, @intCast(second));
     return epoch_s * 1000 + millis;
+}
+
+/// Hot path for Anthropic-API timestamps (always 24-byte `…Z` form).
+fn parseIso8601FastCanonical(s: []const u8) ?i64 {
+    if (s.len != 24) return null;
+    if (s[4] != '-' or s[7] != '-' or s[10] != 'T' or
+        s[13] != ':' or s[16] != ':' or s[19] != '.' or s[23] != 'Z') return null;
+
+    // Wrapping-sub avoids debug panics on non-digit input ('/' → 0xFF), and
+    // keeps fast/slow paths in agreement on what to reject.
+    const digits: @Vector(17, u8) = .{
+        s[0],  s[1],  s[2],  s[3],
+        s[5],  s[6],  s[8],  s[9],
+        s[11], s[12], s[14], s[15],
+        s[17], s[18], s[20], s[21],
+        s[22],
+    };
+    const norm = digits -% @as(@Vector(17, u8), @splat('0'));
+    if (@reduce(.Max, norm) > 9) return null;
+
+    const y: i32 = @as(i32, norm[0]) * 1000 + @as(i32, norm[1]) * 100 +
+        @as(i32, norm[2]) * 10 + @as(i32, norm[3]);
+    const mo: u8 = norm[4] * 10 + norm[5];
+    const d: u8 = norm[6] * 10 + norm[7];
+    const h: i64 = @as(i64, norm[8]) * 10 + norm[9];
+    const mi: i64 = @as(i64, norm[10]) * 10 + norm[11];
+    const se: i64 = @as(i64, norm[12]) * 10 + norm[13];
+    const ms: i64 = @as(i64, norm[14]) * 100 + @as(i64, norm[15]) * 10 + norm[16];
+
+    const days = daysFromCivil(y, mo, d);
+    return (days * 86400 + h * 3600 + mi * 60 + se) * 1000 + ms;
 }
 
 fn parseDecimal(s: []const u8) ?i64 {
@@ -393,6 +426,43 @@ test "parseIso8601ToMs leap year Feb 29" {
     const ts = parseIso8601ToMs("2024-02-29T00:00:00Z").?;
     const expected: i64 = daysFromCivil(2024, 2, 29) * 86400 * 1000;
     try std.testing.expectEqual(expected, ts);
+}
+
+test "parseIso8601FastCanonical happy path" {
+    const ts = parseIso8601FastCanonical("2025-05-08T12:34:56.789Z").?;
+    const expected: i64 = (daysFromCivil(2025, 5, 8) * 86400 + 12 * 3600 + 34 * 60 + 56) * 1000 + 789;
+    try std.testing.expectEqual(expected, ts);
+}
+
+test "parseIso8601FastCanonical rejects non-canonical input" {
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("2025-01-15T10:30:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("2025-01-15t10:30:00.123Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("2025-01-15T10:30:00.12Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("2025-01-15T10:30:00.123 "));
+}
+
+test "parseIso8601FastCanonical rejects malformed digit positions" {
+    // Without digit validation these would return garbage instead of null.
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("A025-01-15T10:30:00.123Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("2025-01-15T10:30:00.A89Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601FastCanonical("2025-/1-15T10:30:00.123Z"));
+}
+
+test "parseIso8601ToMs lowercase t with ms falls through to slow path" {
+    const ts = parseIso8601ToMs("2025-01-15t10:30:00.123Z").?;
+    const expected: i64 = (daysFromCivil(2025, 1, 15) * 86400 + 10 * 3600 + 30 * 60) * 1000 + 123;
+    try std.testing.expectEqual(expected, ts);
+}
+
+test "parseIso8601FastCanonical edge dates" {
+    const cases = [_]struct { s: []const u8, expected: i64 }{
+        .{ .s = "1970-01-01T00:00:00.000Z", .expected = 0 },
+        .{ .s = "2024-02-29T23:59:59.999Z", .expected = (daysFromCivil(2024, 2, 29) * 86400 + 23 * 3600 + 59 * 60 + 59) * 1000 + 999 },
+        .{ .s = "2025-05-08T12:34:56.789Z", .expected = (daysFromCivil(2025, 5, 8) * 86400 + 12 * 3600 + 34 * 60 + 56) * 1000 + 789 },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(c.expected, parseIso8601FastCanonical(c.s).?);
+    }
 }
 
 // --- floorToHourMs edge cases ---

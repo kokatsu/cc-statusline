@@ -412,6 +412,42 @@ fn benchParseJsonl(allocator: std.mem.Allocator, io: Io, content: []const u8, it
     return computeStats(samples);
 }
 
+// ─── Micro bench: parseIso8601ToMs (canonical 24-char input) ──────────────
+
+/// Per-call ns for `time.parseIso8601ToMs` on the canonical fast-path shape.
+/// `sink` feeds back into the year digit so LLVM can't precompute the result
+/// for the small set of inputs it would otherwise see — without it the call
+/// collapsed to ~5 ns.
+fn benchParseIso8601(allocator: std.mem.Allocator, io: Io, iters: u32) !Stats {
+    var sample: [24]u8 = "2025-05-08T12:34:56.789Z".*;
+    const inner_iters: u32 = 100_000;
+
+    var samples = try allocator.alloc(u64, iters);
+    defer allocator.free(samples);
+    var sink: i64 = 0;
+
+    var i: u32 = 0;
+    while (i < warmup_iters) : (i += 1) {
+        var j: u32 = 0;
+        while (j < inner_iters) : (j += 1) {
+            sample[3] = '0' + @as(u8, @intCast(@as(u64, @bitCast(sink)) % 10));
+            sink +%= time.parseIso8601ToMs(&sample) orelse 0;
+        }
+    }
+    i = 0;
+    while (i < iters) : (i += 1) {
+        const start_ts = Io.Clock.awake.now(io);
+        var j: u32 = 0;
+        while (j < inner_iters) : (j += 1) {
+            sample[3] = '0' + @as(u8, @intCast(@as(u64, @bitCast(sink)) % 10));
+            sink +%= time.parseIso8601ToMs(&sample) orelse 0;
+        }
+        samples[i] = @as(u64, @intCast(start_ts.untilNow(io, .awake).nanoseconds)) / inner_iters;
+    }
+    std.mem.doNotOptimizeAway(sink);
+    return computeStats(samples);
+}
+
 // ─── Output ───────────────────────────────────────────────────────────────
 
 const Result = struct {
@@ -424,6 +460,7 @@ const Result = struct {
     full_scan: Stats,
     full_scan_phases: PhaseStats,
     parse_jsonl: Stats,
+    parse_iso8601: Stats,
 
     fn toBaseline(self: Result) BaselineEntry {
         return .{
@@ -431,6 +468,7 @@ const Result = struct {
             .e2e_warm = self.e2e_warm.median_ns,
             .full_scan = self.full_scan.median_ns,
             .parse_jsonl = self.parse_jsonl.median_ns,
+            .parse_iso8601 = self.parse_iso8601.median_ns,
         };
     }
 };
@@ -439,7 +477,8 @@ fn fmtNs(buf: []u8, ns: u64) []const u8 {
     const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
     if (ms >= 1.0) return std.fmt.bufPrint(buf, "{d:.2} ms", .{ms}) catch buf[0..0];
     const us = @as(f64, @floatFromInt(ns)) / 1_000.0;
-    return std.fmt.bufPrint(buf, "{d:.1} us", .{us}) catch buf[0..0];
+    if (us >= 1.0) return std.fmt.bufPrint(buf, "{d:.1} us", .{us}) catch buf[0..0];
+    return std.fmt.bufPrint(buf, "{d} ns", .{ns}) catch buf[0..0];
 }
 
 fn fmtBytes(buf: []u8, n: u64) []const u8 {
@@ -501,6 +540,7 @@ fn printResults(w: *Io.Writer, results: []const Result, baseline: ?BaselineMap) 
         try writeRow(w, "end-to-end (warm)", r.e2e_warm, pickBaseline(base, "e2e_warm"));
         try writeRow(w, "fullScan", r.full_scan, pickBaseline(base, "full_scan"));
         try writeRow(w, "parseJsonlContent", r.parse_jsonl, pickBaseline(base, "parse_jsonl"));
+        try writeRow(w, "parseIso8601 (per call)", r.parse_iso8601, pickBaseline(base, "parse_iso8601"));
         try w.writeAll("\n");
 
         try printPhaseBreakdown(w, r.full_scan, r.full_scan_phases);
@@ -547,6 +587,7 @@ const BaselineEntry = struct {
     e2e_warm: u64,
     full_scan: u64,
     parse_jsonl: u64,
+    parse_iso8601: u64,
 };
 
 const BaselineMap = struct {
@@ -575,6 +616,7 @@ fn readBaseline(io: Io, allocator: std.mem.Allocator) ?BaselineMap {
             .e2e_warm = readNs(obj, "e2e_warm"),
             .full_scan = readNs(obj, "full_scan"),
             .parse_jsonl = readNs(obj, "parse_jsonl"),
+            .parse_iso8601 = readNs(obj, "parse_iso8601"),
         };
         map.put(allocator, e.key_ptr.*, entry) catch continue;
     }
@@ -611,8 +653,8 @@ fn writeBaseline(io: Io, results: []const Result, existing: ?BaselineMap) !void 
         if (!first) try w.interface.writeAll(",\n");
         first = false;
         try w.interface.print(
-            \\  "{s}": {{ "e2e_cold": {d}, "e2e_warm": {d}, "full_scan": {d}, "parse_jsonl": {d} }}
-        , .{ sz.name, entry.e2e_cold, entry.e2e_warm, entry.full_scan, entry.parse_jsonl });
+            \\  "{s}": {{ "e2e_cold": {d}, "e2e_warm": {d}, "full_scan": {d}, "parse_jsonl": {d}, "parse_iso8601": {d} }}
+        , .{ sz.name, entry.e2e_cold, entry.e2e_warm, entry.full_scan, entry.parse_jsonl, entry.parse_iso8601 });
     }
     try w.interface.writeAll("\n}\n");
     try w.interface.flush();
@@ -689,6 +731,7 @@ pub fn main(init: std.process.Init) !void {
         const fs_stats = try benchFullScan(allocator, io, projects_path, now_ms, day_start_ms, default_iters);
         const fs_phases = try benchFullScanProfiled(allocator, io, projects_path, now_ms, day_start_ms, default_iters);
         const pj_stats = try benchParseJsonl(allocator, io, content, default_iters);
+        const pi_stats = try benchParseIso8601(allocator, io, default_iters);
 
         try results.append(allocator, .{
             .size = sz.name,
@@ -700,6 +743,7 @@ pub fn main(init: std.process.Init) !void {
             .full_scan = fs_stats,
             .full_scan_phases = fs_phases,
             .parse_jsonl = pj_stats,
+            .parse_iso8601 = pi_stats,
         });
     }
 
