@@ -240,7 +240,7 @@ fn findFirstNonDstType(types_data: []const u8, typecnt: u32) u8 {
 // Civil date ↔ epoch (Howard Hinnant's algorithm)
 // ============================================================
 
-const CivilDate = struct {
+pub const CivilDate = struct {
     year: i32,
     month: u8,
     day: u8,
@@ -265,7 +265,7 @@ pub fn daysFromCivil(year: i32, month: u8, day: u8) i64 {
 /// Inverse of daysFromCivil combined with intra-day time breakdown.
 /// Caller is responsible for timezone adjustment (pass `epoch_s + offset`
 /// for local time; pass raw epoch seconds for UTC).
-fn epochToCivil(epoch_s: i64) CivilDate {
+pub fn epochToCivil(epoch_s: i64) CivilDate {
     const days_raw: i64 = @divFloor(epoch_s, 86400);
     var rem: i64 = @mod(epoch_s, 86400);
 

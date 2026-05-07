@@ -89,6 +89,32 @@ export CLAUDE_CONFIG_DIR=/path/to/config
 zig build test
 ```
 
+## Benchmark
+
+```sh
+zig build bench -Doptimize=ReleaseFast
+```
+
+Generates synthetic JSONL transcripts at `/tmp/cc-statusline-bench/` (small / medium / large) and reports min / median / p99 for four scenarios:
+
+| scenario              | what it measures                                         |
+|-----------------------|----------------------------------------------------------|
+| `end-to-end (cold)`   | spawning the binary with the cache file deleted          |
+| `end-to-end (warm)`   | spawning with a hot 30s result cache                     |
+| `fullScan`            | `scan.benchFullScan` only (parses every JSONL)           |
+| `parseJsonlContent`   | the JSONL parser on a single fixture file                |
+
+The harness saves the user's real cache to `/tmp/cc-statusline-cache.bin.bench-bak` while running and restores it on exit, so it does not pollute live statusline output.
+
+Useful flags (pass after `--`):
+
+```sh
+zig build bench -Doptimize=ReleaseFast -- --save             # record bench/baseline.json
+zig build bench -Doptimize=ReleaseFast -- --size=medium      # run only one fixture size
+```
+
+When `bench/baseline.json` exists, each row is annotated with its delta vs. the recorded median.
+
 ## Acknowledgments
 
 - The transcript scanning logic (5-hour block detection, message+request ID

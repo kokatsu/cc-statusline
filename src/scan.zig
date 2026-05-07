@@ -25,7 +25,7 @@ const getI64Field = ju.getI64Field;
 // Constants
 // ============================================================
 
-const cache_path = "/tmp/cc-statusline-cache.bin";
+pub const cache_path = "/tmp/cc-statusline-cache.bin";
 const cache_ttl_s: i64 = 30;
 const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
@@ -137,7 +137,7 @@ fn scanDirRecursive(allocator: std.mem.Allocator, base_path: []const u8, rel_pat
     }
 }
 
-fn parseJsonlContent(allocator: std.mem.Allocator, dedup_alloc: std.mem.Allocator, content: []const u8, entries: *std.ArrayList(TranscriptEntry), seen: *std.StringHashMapUnmanaged(void)) void {
+pub fn parseJsonlContent(allocator: std.mem.Allocator, dedup_alloc: std.mem.Allocator, content: []const u8, entries: *std.ArrayList(TranscriptEntry), seen: *std.StringHashMapUnmanaged(void)) void {
     var lines = mem.splitSequence(u8, content, "\n");
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -441,6 +441,15 @@ fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, la
 // ============================================================
 // Scan Orchestration
 // ============================================================
+
+/// Bench-only entry that bypasses cache and forces a full scan from `projects_path`.
+/// `cc-statusline` itself goes through `scanTranscripts`; benches use this to measure
+/// the cold path in isolation without touching the on-disk cache.
+pub fn benchFullScan(io: Io, allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, day_start_ms: i64) ScanResult {
+    g_io = io;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, null);
+}
 
 pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64) ?ScanResult {
     g_io = io;

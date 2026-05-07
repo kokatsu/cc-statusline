@@ -55,4 +55,27 @@ pub fn build(b: *std.Build) void {
         "scripts/cover.sh",
     });
     cover_step.dependOn(&run_cover.step);
+
+    // Bench step: zig build bench [-- --save] [-- --size=small|medium|large]
+    // Built ReleaseFast unconditionally so numbers reflect production behavior;
+    // the macro bench spawns whatever `exe` was built with `optimize`, so
+    // prefer `zig build bench -Doptimize=ReleaseFast` for both layers.
+    const bench = b.addExecutable(.{
+        .name = "cc-statusline-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = false,
+        }),
+    });
+
+    const bench_step = b.step("bench", "Run benchmarks (-- --save updates baseline, -- --size=NAME filters)");
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addArtifactArg(exe);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    bench_step.dependOn(&run_bench.step);
+    run_bench.step.dependOn(b.getInstallStep());
 }
