@@ -352,10 +352,29 @@ fn parseJsonlLine(
     // Order matches the previous DOM-based parser: dedup runs before
     // timestamp/usage validation, so a line with msg/req IDs but missing
     // timestamp still claims its dedup key.
+    //
+    // The stack buffer keeps the hit path allocation-free; only the first
+    // occurrence of a key pays for a heap copy. Keys whose combined length
+    // exceeds 256 bytes fall through to the legacy alloc path.
     if (p.msg_id) |mid| if (p.req_id) |rid| {
-        const dedup_key = try std.fmt.allocPrint(dedup_alloc, "{s}:{s}", .{ mid, rid });
-        const gop = try seen.getOrPut(dedup_alloc, dedup_key);
-        if (gop.found_existing) return;
+        var key_buf: [256]u8 = undefined;
+        const total = mid.len + 1 + rid.len;
+        if (total <= key_buf.len) {
+            @memcpy(key_buf[0..mid.len], mid);
+            key_buf[mid.len] = ':';
+            @memcpy(key_buf[mid.len + 1 ..][0..rid.len], rid);
+            const stack_key = key_buf[0..total];
+            const gop = try seen.getOrPut(dedup_alloc, stack_key);
+            if (gop.found_existing) return;
+            // Promote the borrowed slice to a heap copy so the entry
+            // outlives this stack frame. Hash is unchanged (same bytes),
+            // so the bucket position stays valid.
+            gop.key_ptr.* = try dedup_alloc.dupe(u8, stack_key);
+        } else {
+            const dedup_key = try std.fmt.allocPrint(dedup_alloc, "{s}:{s}", .{ mid, rid });
+            const gop = try seen.getOrPut(dedup_alloc, dedup_key);
+            if (gop.found_existing) return;
+        }
     };
 
     if (!p.have_usage) return;
