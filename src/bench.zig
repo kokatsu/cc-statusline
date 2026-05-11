@@ -407,7 +407,7 @@ fn benchParseJsonl(allocator: std.mem.Allocator, io: Io, content: []const u8, it
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var entries: std.ArrayList(scan.TranscriptEntry) = .empty;
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var seen: scan.DedupSet = .empty;
         scan.parseJsonlContent(arena.allocator(), arena.allocator(), content, &entries, &seen);
     }
     i = 0;
@@ -415,7 +415,7 @@ fn benchParseJsonl(allocator: std.mem.Allocator, io: Io, content: []const u8, it
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var entries: std.ArrayList(scan.TranscriptEntry) = .empty;
-        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        var seen: scan.DedupSet = .empty;
         const start_ts = Io.Clock.awake.now(io);
         scan.parseJsonlContent(arena.allocator(), arena.allocator(), content, &entries, &seen);
         samples[i] = @intCast(start_ts.untilNow(io, .awake).nanoseconds);

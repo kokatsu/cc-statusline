@@ -17,6 +17,10 @@ const TokenUsage = pricing.TokenUsage;
 // Constants
 // ============================================================
 
+/// Per-scan dedup set keyed by Wyhash(msg_id ":" req_id). Collisions are
+/// negligible at observed scan sizes (~10^5 UUID-pair entries).
+pub const DedupSet = std.AutoHashMapUnmanaged(u64, void);
+
 pub const cache_path = "/tmp/cc-statusline-cache.bin";
 const cache_ttl_s: i64 = 30;
 const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
@@ -29,6 +33,12 @@ const file_list_ttl_s: i64 = 300;
 const cache_max_bytes: usize = 1 * 1024 * 1024;
 // Reader buffer for JSONL streaming; must hold one full line.
 const jsonl_buf_size: usize = 64 * 1024;
+// Cap on the one-shot JSONL read buffer. Beyond this, `jsonlReadBuf` falls
+// back to streaming via the caller's stack buffer rather than reserving
+// arbitrarily large resident memory (overcommit allocators don't fail on
+// alloc, they OOM at first-touch). 16 MiB covers any realistic 25-hour
+// activity window of Anthropic transcripts (typical 100 KiB–5 MiB).
+const jsonl_max_buf_size: usize = 16 * 1024 * 1024;
 // Fast-reject prefilter for lines that lack a usage block. Must stay in sync
 // with the JSON key matched at `Parser.parseUsage` — drift only degrades
 // throughput (the prefilter becomes useless), it never silently drops entries.
@@ -138,7 +148,21 @@ fn scanDirRecursive(allocator: std.mem.Allocator, dir_path: []const u8, files: *
     }
 }
 
-pub fn parseJsonlContent(allocator: std.mem.Allocator, dedup_alloc: std.mem.Allocator, content: []const u8, entries: *std.ArrayList(TranscriptEntry), seen: *std.StringHashMapUnmanaged(void)) void {
+/// Reader buffer sized so a typical transcript reads in a single syscall:
+/// `fi.size` (stat-time lower bound) plus a 64 KiB slack to absorb appends
+/// from an active session writing concurrently. Falls back to `stack_buf` (a
+/// 64 KiB streaming buffer) when the requested size exceeds `jsonl_max_buf_size`
+/// or arena alloc fails up front — the cap is what defends against pathological
+/// files since overcommit allocators don't fail on alloc, they OOM at first
+/// touch. Arena memory under `retain_capacity` reset can hold ~1.5× the largest
+/// allocated buffer across the scan, so the cap also bounds steady-state RSS.
+fn jsonlReadBuf(tmp: std.mem.Allocator, fi_size: i64, stack_buf: []u8) []u8 {
+    const buf_size = @as(usize, @intCast(fi_size)) + jsonl_buf_size;
+    if (buf_size > jsonl_max_buf_size) return stack_buf;
+    return tmp.alloc(u8, buf_size) catch stack_buf;
+}
+
+pub fn parseJsonlContent(allocator: std.mem.Allocator, dedup_alloc: std.mem.Allocator, content: []const u8, entries: *std.ArrayList(TranscriptEntry), seen: *DedupSet) void {
     var reader = std.Io.Reader.fixed(content);
     parseJsonlReader(allocator, dedup_alloc, &reader, entries, seen);
 }
@@ -150,7 +174,7 @@ pub fn parseJsonlReader(
     dedup_alloc: std.mem.Allocator,
     reader: *std.Io.Reader,
     entries: *std.ArrayList(TranscriptEntry),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *DedupSet,
 ) void {
     while (true) {
         const line_opt = reader.takeDelimiter('\n') catch |err| switch (err) {
@@ -174,7 +198,7 @@ fn handleLine(
     dedup_alloc: std.mem.Allocator,
     line: []const u8,
     entries: *std.ArrayList(TranscriptEntry),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *DedupSet,
 ) void {
     if (line.len == 0) return;
     if (mem.indexOf(u8, line, usage_marker) == null) return;
@@ -495,38 +519,22 @@ fn parseJsonlLine(
     dedup_alloc: std.mem.Allocator,
     line: []const u8,
     entries: *std.ArrayList(TranscriptEntry),
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *DedupSet,
 ) !void {
     var p = Parser.init(line);
     if (!try p.scanner.enterObject()) return;
     try p.parseTopLevel();
 
-    // Order matches the previous DOM-based parser: dedup runs before
-    // timestamp/usage validation, so a line with msg/req IDs but missing
-    // timestamp still claims its dedup key.
-    //
-    // The stack buffer keeps the hit path allocation-free; only the first
-    // occurrence of a key pays for a heap copy. Keys whose combined length
-    // exceeds 256 bytes fall through to the legacy alloc path.
+    // Dedup runs before timestamp/usage validation: a line missing timestamp
+    // still claims its dedup key. Preserves the previous DOM parser's ordering
+    // so out-of-band scans see the same set of unique entries.
     if (p.msg_id) |mid| if (p.req_id) |rid| {
-        var key_buf: [256]u8 = undefined;
-        const total = mid.len + 1 + rid.len;
-        if (total <= key_buf.len) {
-            @memcpy(key_buf[0..mid.len], mid);
-            key_buf[mid.len] = ':';
-            @memcpy(key_buf[mid.len + 1 ..][0..rid.len], rid);
-            const stack_key = key_buf[0..total];
-            const gop = try seen.getOrPut(dedup_alloc, stack_key);
-            if (gop.found_existing) return;
-            // Promote the borrowed slice to a heap copy so the entry
-            // outlives this stack frame. Hash is unchanged (same bytes),
-            // so the bucket position stays valid.
-            gop.key_ptr.* = try dedup_alloc.dupe(u8, stack_key);
-        } else {
-            const dedup_key = try std.fmt.allocPrint(dedup_alloc, "{s}:{s}", .{ mid, rid });
-            const gop = try seen.getOrPut(dedup_alloc, dedup_key);
-            if (gop.found_existing) return;
-        }
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(mid);
+        hasher.update(":");
+        hasher.update(rid);
+        const gop = try seen.getOrPut(dedup_alloc, hasher.final());
+        if (gop.found_existing) return;
     };
 
     if (!p.have_usage) return;
@@ -844,7 +852,7 @@ pub fn benchFullScanProfiled(
 
     var tmp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer tmp_arena.deinit();
-    var global_seen: std.StringHashMapUnmanaged(void) = .empty;
+    var global_seen: DedupSet = .empty;
 
     for (file_infos) |fi| {
         _ = tmp_arena.reset(.retain_capacity);
@@ -853,8 +861,9 @@ pub fn benchFullScanProfiled(
         ts = Io.Clock.awake.now(io);
         var f = Io.Dir.openFileAbsolute(io, fi.path, .{}) catch continue;
         defer f.close(io);
-        var rbuf: [jsonl_buf_size]u8 = undefined;
-        var reader = f.readerStreaming(io, &rbuf);
+        var stack_buf: [jsonl_buf_size]u8 = undefined;
+        const rbuf = jsonlReadBuf(tmp, fi.size, &stack_buf);
+        var reader = f.readerStreaming(io, rbuf);
         timings[@intFromEnum(Phase.open)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
 
         ts = Io.Clock.awake.now(io);
@@ -974,7 +983,7 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
     var block_diff_cost: f64 = 0;
     var new_files: std.ArrayList(CachedFileEntry) = .empty;
     new_files.ensureTotalCapacityPrecise(allocator, cached.files.len) catch {};
-    var global_seen: std.StringHashMapUnmanaged(void) = .empty;
+    var global_seen: DedupSet = .empty;
 
     for (cached.files) |entry| {
         if (changed.get(entry.path)) |ch| {
@@ -1052,7 +1061,7 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
 
     var tmp_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer tmp_arena.deinit();
-    var global_seen: std.StringHashMapUnmanaged(void) = .empty;
+    var global_seen: DedupSet = .empty;
 
     for (file_infos) |fi| {
         _ = tmp_arena.reset(.retain_capacity);
@@ -1060,8 +1069,9 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
 
         var f = Io.Dir.openFileAbsolute(g_io, fi.path, .{}) catch continue;
         defer f.close(g_io);
-        var rbuf: [jsonl_buf_size]u8 = undefined;
-        var reader = f.readerStreaming(g_io, &rbuf);
+        var stack_buf: [jsonl_buf_size]u8 = undefined;
+        const rbuf = jsonlReadBuf(tmp, fi.size, &stack_buf);
+        var reader = f.readerStreaming(g_io, rbuf);
 
         var file_entries: std.ArrayList(TranscriptEntry) = .empty;
         parseJsonlReader(tmp, allocator, &reader.interface, &file_entries, &global_seen);
@@ -1169,7 +1179,7 @@ test "parseJsonlContent global dedup across files" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var global_seen = std.StringHashMapUnmanaged(void).empty;
+    var global_seen = DedupSet.empty;
 
     const line =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}},"requestId":"req_001"}
@@ -1189,7 +1199,7 @@ test "parseJsonlContent per-file dedup still works" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
 
     const content =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}},"requestId":"req_001"}
@@ -1207,7 +1217,7 @@ test "parseJsonlContent no dedup without ids" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
 
     const content =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
@@ -1408,7 +1418,7 @@ test "parseJsonlContent skips invalid json with input_tokens" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     // Contains "input_tokens" but is not valid JSON
@@ -1420,7 +1430,7 @@ test "parseJsonlContent skips entry without timestamp" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     const line =
@@ -1434,7 +1444,7 @@ test "parseJsonlContent skips entry without usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     // Has timestamp and message but no usage (and "input_tokens" in another field to pass the prefix filter)
@@ -1449,7 +1459,7 @@ test "parseJsonlContent model fallback to unknown" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     // No model field in message
@@ -1486,7 +1496,7 @@ test "parseJsonlReader recovers lines exceeding the reader buffer" {
     var rbuf: [1024]u8 = undefined;
     var reader = f.readerStreaming(std.testing.io, &rbuf);
 
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
     parseJsonlReader(alloc, alloc, &reader.interface, &entries, &seen);
 
@@ -1774,7 +1784,7 @@ test "parseJsonlContent parses speed fast" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     const line =
@@ -1789,7 +1799,7 @@ test "parseJsonlContent speed non-fast is false" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     const line =
@@ -1804,7 +1814,7 @@ test "parseJsonlContent no speed field is false" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     const line =
@@ -2118,7 +2128,7 @@ test "parseJsonlContent realistic Claude schema with content array" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    var seen = DedupSet.empty;
     var entries: std.ArrayList(TranscriptEntry) = .empty;
 
     const line =
@@ -2193,7 +2203,7 @@ test "parseJsonlContent golden table" {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();
-        var seen = std.StringHashMapUnmanaged(void).empty;
+        var seen = DedupSet.empty;
         var entries: std.ArrayList(TranscriptEntry) = .empty;
         parseJsonlContent(alloc, alloc, c.line, &entries, &seen);
 
