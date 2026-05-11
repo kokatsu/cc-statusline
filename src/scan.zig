@@ -965,6 +965,12 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
         return cached.scan;
     }
 
+    // If the cached block is null but a resets_at window is active, diffScan cannot
+    // synthesize a fresh block from per-file diffs alone — fall through to fullScan
+    // so the new entries can re-establish it. Without this, block stays null until
+    // file_list_ttl_s (5 min) elapses, manifesting as "5h cost shows up late."
+    if (resets_at_ms != null and cached.scan.block == null) return null;
+
     var block_diff_cost: f64 = 0;
     var new_files: std.ArrayList(CachedFileEntry) = .empty;
     new_files.ensureTotalCapacityPrecise(allocator, cached.files.len) catch {};
@@ -1683,6 +1689,83 @@ test "diffScan total_diff_cost zero preserves cached block" {
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.block != null);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.?.block.?.cost, 1e-10);
+}
+
+test "diffScan falls through to fullScan when cached block is null and new entries arrive with resets_at_ms" {
+    // Reproduces the "5h block displayed late after window reset" bug:
+    // When a fresh 5h window begins with no in-window entries, computeBlockFromWindow
+    // caches block=null. Once a new entry is appended to the transcript, diffScan
+    // must not silently keep block=null — return null so the caller re-runs fullScan
+    // and can re-establish the block from the new entry.
+    const path = "/tmp/cc-test-diffscan-nullblock-resets.jsonl";
+    const old_content = "pre-window placeholder\n";
+    const new_line =
+        \\{"timestamp":"2025-06-15T11:30:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
+    ;
+    var full_buf: [512]u8 = undefined;
+    const full_content = std.fmt.bufPrint(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
+    try createTmpFile(path, full_content);
+    defer removeTmpFile(path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const old_size: i64 = @intCast(old_content.len);
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    // resets_at puts the [reset-5h, reset] window straddling now_ms.
+    const resets_at_ms: i64 = now_ms + 3600 * 1000;
+
+    const cached = CacheResult{
+        // block=null simulates "window just reset, no in-window usage yet at last fullScan"
+        .scan = .{ .today_cost = 0.0, .block = null },
+        .files = &[_]CachedFileEntry{
+            .{ .path = path, .file_size = old_size, .per_file_cost = 0.0, .parsed_size = old_size },
+        },
+        .write_time_s = now_s - 60,
+        .last_full_scan_s = now_s - 60,
+        .day_start_ms = day_start_ms,
+    };
+
+    try std.testing.expectEqual(
+        @as(?ScanResult, null),
+        diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms),
+    );
+}
+
+test "diffScan keeps cached null block when no files changed (no false fullScan)" {
+    // Guard against over-eager fallback: when the window is empty AND nothing changed,
+    // diffScan should still return the cached result (block=null) rather than triggering
+    // a useless fullScan. Only new entries warrant falling through.
+    const path = "/tmp/cc-test-diffscan-nullblock-unchanged.jsonl";
+    try createTmpFile(path, "placeholder\n");
+    defer removeTmpFile(path);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const file_size = statFileSize(path);
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    const resets_at_ms: i64 = now_ms + 3600 * 1000;
+
+    const cached = CacheResult{
+        .scan = .{ .today_cost = 0.0, .block = null },
+        .files = &[_]CachedFileEntry{
+            .{ .path = path, .file_size = file_size, .per_file_cost = 0.0, .parsed_size = file_size },
+        },
+        .write_time_s = now_s - 60,
+        .last_full_scan_s = now_s - 60,
+        .day_start_ms = day_start_ms,
+    };
+
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqual(@as(?BlockInfo, null), result.?.block);
 }
 
 // --- parseJsonlContent fast mode ---
