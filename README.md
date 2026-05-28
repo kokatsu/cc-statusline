@@ -12,7 +12,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown
 - **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
-- **Pricing** — Supports Opus 4.7/4.6/4.5/4.1/4/3, Sonnet 4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing)
+- **Pricing** — Supports Opus 4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
 - **Theming** — Built-in Catppuccin Mocha theme, fully customizable via environment variables
 
 ## Requirements
@@ -32,7 +32,7 @@ The binary is output to `zig-out/bin/cc-statusline`.
 cc-statusline reads Claude Code's statusline JSON from stdin and outputs ANSI-colored status (2-3 lines depending on available data):
 
 ```text
-🤖 Opus 4.7 (1M context) | 🌿 main | 🧠 ██████▓░░░ 63%
+🤖 Opus 4.8 (1M context) | 🌿 main | 🧠 ██████▓░░░ 63%
 💰 $26.79 today | 📊 $5.27 block 🔥 $11.33 /h
 🕔 5h ████▓░░░░░ 42% 1h 30m 05/08 01:00 | 📅 7d ░░░░░░░░░░ 4% 4d 11h 05/12 08:00
 ```

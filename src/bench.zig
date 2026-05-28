@@ -63,7 +63,7 @@ const fixture_seed: u64 = 0xb3c5_1ed5_a55e_d42c;
 const intra_dup_pct: u8 = 7; // resumed-session reuse within one file
 const cross_dup_pct: u8 = 5; // resumed-session reuse from previous file
 const usage_200k_pct: u8 = 50; // exercise the 200k tier branch
-const fast_pct: u8 = 5; // exercise the fast-mode 6× multiplier
+const fast_pct: u8 = 5; // exercise the fast-mode rate path (per-model rates set in pricing.zig)
 
 const ring_capacity: usize = 256;
 
@@ -108,8 +108,10 @@ const usage_fast: UsageProfile = .{ .input = 150, .output = 80, .cc_5m = 0, .cr 
 const usage_premium: UsageProfile = .{ .input = 180_000, .output = 5_000, .cc_5m = 30_000, .cr = 10_000, .is_fast = false };
 
 fn pickModel(roll: u8) []const u8 {
-    if (roll < 70) return "claude-sonnet-4-5-20250929";
-    if (roll < 90) return "claude-opus-4-5-20251212";
+    if (roll < 50) return "claude-sonnet-4-5-20250929";
+    if (roll < 70) return "claude-opus-4-7";
+    if (roll < 85) return "claude-opus-4-8";
+    if (roll < 95) return "claude-opus-4-5-20251212";
     return "claude-haiku-4-5-20251001";
 }
 

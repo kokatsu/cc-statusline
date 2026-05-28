@@ -1795,6 +1795,24 @@ test "parseJsonlContent parses speed fast" {
     try std.testing.expect(entries.items[0].usage.is_fast);
 }
 
+test "parseJsonlContent opus 4.8 fast flows through entryCost at fast rates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"model":"claude-opus-4-8","usage":{"input_tokens":100,"output_tokens":50,"speed":"fast"}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expect(entries.items[0].usage.is_fast);
+    // 100 * 1e-5 (fast.input) + 50 * 5e-5 (fast.output) = 0.001 + 0.0025 = 0.0035
+    const cost = entryCost(entries.items[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0035), cost, 1e-10);
+}
+
 test "parseJsonlContent speed non-fast is false" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
