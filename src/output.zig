@@ -14,20 +14,32 @@ const ms_per_min = types.ms_per_min;
 // Constants
 // ============================================================
 
-pub const bar_width: u8 = 10;
+pub const default_bar_width: u8 = 10;
 pub const default_branch_max: usize = 24;
 
 /// Upper bound enforced by `parseBranchMax` so `truncateBranch` can always
 /// append its 3-byte ellipsis without overflowing its output buffer.
 pub const branch_max_upper: usize = 254;
 
-/// Buffer size for progress bars. `bar_width` (10 codepoints) × an extended
+/// Buffer size for progress bars. `default_bar_width` (10 codepoints) × an extended
 /// grapheme cluster of up to ~25 bytes keeps output inside a single memcpy.
 const progress_bar_buf_size: usize = 256;
 
 // ============================================================
 // Theme
 // ============================================================
+
+/// How much reset-time information is shown after each rate-limit percentage,
+/// chosen by `layoutForColumns` once the bar can no longer shrink further.
+pub const ResetInfo = enum {
+    /// duration ("3d 12h") + datetime ("MM/DD HH:MM").
+    full,
+    /// duration only — datetime is the first thing dropped because it is
+    /// derivable from `now + duration`.
+    duration_only,
+    /// no reset info at all — the narrowest layout.
+    none,
+};
 
 pub const Theme = struct {
     model: []const u8,
@@ -41,6 +53,11 @@ pub const Theme = struct {
     bar_transition: []const u8 = "\xe2\x96\x93", // ▓ U+2593
     bar_empty: []const u8 = "\xe2\x96\x91", // ░ U+2591
     branch_max: usize = default_branch_max,
+    /// Progress bar width in codepoints, sized to the terminal via `COLUMNS`.
+    /// `0` hides the bar entirely.
+    bar_width: u8 = default_bar_width,
+    /// How much rate-limit reset info to render (also sized from `COLUMNS`).
+    reset_info: ResetInfo = .full,
 };
 
 pub const theme_default = Theme{
@@ -124,8 +141,49 @@ pub fn buildTheme(theme_name: ?[]const u8, overrides: ThemeOverrides) Theme {
     return theme;
 }
 
+/// Bar width plus how much reset info to render, derived together from `COLUMNS`.
+pub const Layout = struct {
+    bar_width: u8,
+    reset_info: ResetInfo,
+};
+
+/// Map a terminal column count to a rate-limit-line layout via fixed breakpoints.
+///
+/// The 5h/7d rate-limit line is the widest layout we render. Each window is
+/// `label(2) + bar(W) + "100%"(4) + duration(max `max_reset_duration_cols`=7,
+/// e.g. "23h 59m") + "MM/DD HH:MM"(11)` with single-space gaps; there are two
+/// of them plus the leading 🕔/📅 emoji and the " | " divider. Worst-case widths:
+///
+///     bar present:   65 + 2 * bar_width   (line = 69..85 for W ∈ {2..10})
+///     bar hidden:    63                   (drops `bar+sp` per window → -2)
+///     duration only: 39                   (drops ` MM/DD HH:MM` per window → -24)
+///     none:          23                   (drops ` 23h 59m` per window → -16)
+///
+/// Each threshold is the smallest COLUMNS at which the corresponding worst-case
+/// width still fits, so the line never wraps. Below ~23 columns there is nothing
+/// left to drop short of splitting into multiple lines, so the floor stops there.
+pub fn layoutForColumns(cols: u16) Layout {
+    if (cols >= 85) return .{ .bar_width = 10, .reset_info = .full }; // 65 + 20
+    if (cols >= 81) return .{ .bar_width = 8, .reset_info = .full }; // 65 + 16
+    if (cols >= 77) return .{ .bar_width = 6, .reset_info = .full }; // 65 + 12
+    if (cols >= 73) return .{ .bar_width = 4, .reset_info = .full }; // 65 + 8
+    if (cols >= 69) return .{ .bar_width = 2, .reset_info = .full }; // 65 + 4
+    if (cols >= 63) return .{ .bar_width = 0, .reset_info = .full }; // 63
+    if (cols >= 39) return .{ .bar_width = 0, .reset_info = .duration_only }; // 39
+    return .{ .bar_width = 0, .reset_info = .none }; // 23
+}
+
+/// Parse the `COLUMNS` value into a `Layout`. Absent or unparseable (older
+/// Claude Code, or a non-terminal pipe) falls back to the full layout.
+fn parseLayout(val: ?[]const u8) Layout {
+    const default: Layout = .{ .bar_width = default_bar_width, .reset_info = .full };
+    const s = val orelse return default;
+    const cols = std.fmt.parseInt(u16, s, 10) catch return default;
+    return layoutForColumns(cols);
+}
+
 pub fn initTheme(env: *const std.process.Environ.Map) Theme {
-    return buildTheme(
+    var theme = buildTheme(
         env.get("CC_STATUSLINE_THEME"),
         .{
             .model = env.get("CC_STATUSLINE_COLOR_MODEL"),
@@ -140,6 +198,10 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
             .branch_max = env.get("CC_STATUSLINE_BRANCH_MAX"),
         },
     );
+    const layout = parseLayout(env.get("COLUMNS"));
+    theme.bar_width = layout.bar_width;
+    theme.reset_info = layout.reset_info;
+    return theme;
 }
 
 // (Types moved to types.zig)
@@ -204,6 +266,12 @@ pub fn buildProgressBar(buf: []u8, pct: f64, width: u8, bar_filled: []const u8, 
     return buf[0..pos];
 }
 
+/// Worst-case display width of `formatResetDuration`'s output, in columns.
+/// Hit by the `"{d}h {d}m"` branch when hours have two digits and minutes have
+/// two digits, e.g. `"23h 59m"` (7 columns). `layoutForColumns` depends on
+/// this — bump it together if the formatter is ever widened.
+pub const max_reset_duration_cols: u8 = 7;
+
 pub fn formatResetDuration(buf: []u8, remaining_ms: i64) []const u8 {
     if (remaining_ms <= 0) return "now";
     const total_min = @divFloor(remaining_ms, @as(i64, ms_per_min));
@@ -245,22 +313,33 @@ pub fn parseBranchMax(val: ?[]const u8) usize {
 
 fn writeRateLimitWindow(w: *Writer, theme: Theme, label: []const u8, rl: RateLimitWindow, now_ms: i64, utc_offset_s: i32) !void {
     const usage_color = rateLimitUsageColor(theme, rl.used_percentage);
-    var bar_buf: [progress_bar_buf_size]u8 = undefined;
-    const bar = buildProgressBar(&bar_buf, rl.used_percentage, bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
-    try w.print("{s}{s}{s} {s}{s}{s} {s}{d:.0}%{s}", .{
-        theme.dim,   label,
-        theme.reset, usage_color,
-        bar,         theme.reset,
-        usage_color, rl.used_percentage,
-        theme.reset,
-    });
+    if (theme.bar_width > 0) {
+        var bar_buf: [progress_bar_buf_size]u8 = undefined;
+        const bar = buildProgressBar(&bar_buf, rl.used_percentage, theme.bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
+        try w.print("{s}{s}{s} {s}{s}{s} {s}{d:.0}%{s}", .{
+            theme.dim,   label,
+            theme.reset, usage_color,
+            bar,         theme.reset,
+            usage_color, rl.used_percentage,
+            theme.reset,
+        });
+    } else {
+        try w.print("{s}{s}{s} {s}{d:.0}%{s}", .{
+            theme.dim,   label,              theme.reset,
+            usage_color, rl.used_percentage, theme.reset,
+        });
+    }
     if (rl.resets_at_ms) |reset_ms| {
-        const remaining = reset_ms - now_ms;
-        const time_color = rateLimitTimeColor(theme, remaining);
-        var reset_buf: [64]u8 = undefined;
-        try w.print(" {s}{s}{s}", .{ time_color, formatResetDuration(&reset_buf, remaining), theme.reset });
-        var dt_buf: [16]u8 = undefined;
-        try w.print(" {s}{s}{s}", .{ theme.dim, time.formatLocalDateTime(&dt_buf, reset_ms, utc_offset_s), theme.reset });
+        if (theme.reset_info != .none) {
+            const remaining = reset_ms - now_ms;
+            const time_color = rateLimitTimeColor(theme, remaining);
+            var reset_buf: [64]u8 = undefined;
+            try w.print(" {s}{s}{s}", .{ time_color, formatResetDuration(&reset_buf, remaining), theme.reset });
+            if (theme.reset_info == .full) {
+                var dt_buf: [16]u8 = undefined;
+                try w.print(" {s}{s}{s}", .{ theme.dim, time.formatLocalDateTime(&dt_buf, reset_ms, utc_offset_s), theme.reset });
+            }
+        }
     }
 }
 
@@ -285,9 +364,13 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
     // Context
     if (stdin_info.context_pct) |pct| {
         const color = contextColor(theme, pct);
-        var bar_buf: [progress_bar_buf_size]u8 = undefined;
-        const bar = buildProgressBar(&bar_buf, pct, bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
-        try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 {s}{s}{s} {s}{d:.0}%{s}", .{ theme.dim, theme.reset, color, bar, theme.reset, color, pct, theme.reset });
+        if (theme.bar_width > 0) {
+            var bar_buf: [progress_bar_buf_size]u8 = undefined;
+            const bar = buildProgressBar(&bar_buf, pct, theme.bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
+            try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 {s}{s}{s} {s}{d:.0}%{s}", .{ theme.dim, theme.reset, color, bar, theme.reset, color, pct, theme.reset });
+        } else {
+            try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 {s}{d:.0}%{s}", .{ theme.dim, theme.reset, color, pct, theme.reset });
+        }
     } else {
         try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 N/A", .{ theme.dim, theme.reset });
     }
@@ -938,4 +1021,152 @@ test "buildProgressBar width 1" {
     var buf: [256]u8 = undefined;
     const result = buildProgressBar(&buf, 50.0, 1, "#", "=", "-");
     try std.testing.expect(result.len > 0);
+}
+
+// --- layoutForColumns ---
+
+test "layoutForColumns bar-shrink breakpoints" {
+    try std.testing.expectEqual(Layout{ .bar_width = 10, .reset_info = .full }, layoutForColumns(200));
+    try std.testing.expectEqual(Layout{ .bar_width = 10, .reset_info = .full }, layoutForColumns(85));
+    try std.testing.expectEqual(Layout{ .bar_width = 8, .reset_info = .full }, layoutForColumns(84));
+    try std.testing.expectEqual(Layout{ .bar_width = 8, .reset_info = .full }, layoutForColumns(81));
+    try std.testing.expectEqual(Layout{ .bar_width = 6, .reset_info = .full }, layoutForColumns(80));
+    try std.testing.expectEqual(Layout{ .bar_width = 6, .reset_info = .full }, layoutForColumns(77));
+    try std.testing.expectEqual(Layout{ .bar_width = 4, .reset_info = .full }, layoutForColumns(76));
+    try std.testing.expectEqual(Layout{ .bar_width = 4, .reset_info = .full }, layoutForColumns(73));
+    try std.testing.expectEqual(Layout{ .bar_width = 2, .reset_info = .full }, layoutForColumns(72));
+    try std.testing.expectEqual(Layout{ .bar_width = 2, .reset_info = .full }, layoutForColumns(69));
+}
+
+test "layoutForColumns reset-info breakpoints" {
+    // Bar gone, reset info still full.
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .full }, layoutForColumns(68));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .full }, layoutForColumns(63));
+    // Datetime dropped.
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .duration_only }, layoutForColumns(62));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .duration_only }, layoutForColumns(39));
+    // Duration dropped too.
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, layoutForColumns(38));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, layoutForColumns(0));
+}
+
+test "parseLayout fallback and parsing" {
+    const default: Layout = .{ .bar_width = default_bar_width, .reset_info = .full };
+    try std.testing.expectEqual(default, parseLayout(null)); // COLUMNS unset
+    try std.testing.expectEqual(default, parseLayout("not-a-number"));
+    try std.testing.expectEqual(default, parseLayout("99999")); // overflow u16
+    try std.testing.expectEqual(Layout{ .bar_width = 10, .reset_info = .full }, parseLayout("120"));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .duration_only }, parseLayout("50"));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, parseLayout("30"));
+}
+
+// --- bar hiding (bar_width == 0) ---
+
+test "printOutput hides context bar when bar_width 0" {
+    var theme = theme_default;
+    theme.bar_width = 0;
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .context_pct = 42.0 };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "42%")); // percentage still shown
+    try std.testing.expect(!contains(out, theme.bar_filled)); // █ gone
+    try std.testing.expect(!contains(out, theme.bar_empty)); // ░ gone
+    try std.testing.expect(!contains(out, "  ")); // no double space left behind
+}
+
+test "printOutput hides rate-limit bars when bar_width 0" {
+    var theme = theme_default;
+    theme.bar_width = 0;
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{
+        .rate_limit_5h = .{ .used_percentage = 42.0 },
+        .rate_limit_7d = .{ .used_percentage = 86.0 },
+    };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "42%"));
+    try std.testing.expect(contains(out, "86%"));
+    try std.testing.expect(!contains(out, theme.bar_filled));
+    try std.testing.expect(!contains(out, "  "));
+}
+
+/// Terminal display width: strips ANSI CSI escapes and counts emoji (the only
+/// codepoints we emit above the BMP) as 2 columns, everything else as 1.
+fn displayWidth(s: []const u8) usize {
+    var width: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
+            i += 2;
+            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7e)) i += 1; // params
+            if (i < s.len) i += 1; // final byte
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const cp = std.unicode.utf8Decode(s[i..][0..len]) catch {
+            i += 1;
+            continue;
+        };
+        width += if (cp >= 0x1F000) @as(usize, 2) else 1;
+        i += len;
+    }
+    return width;
+}
+
+/// Render the worst-case rate-limit output for `cols` and return the rendered
+/// rate-limit line (the last non-empty line). Caller owns the slice via `aw`.
+///
+/// Worst case: both windows, 100% usage ("100%" = 4 cols) and a reset duration
+/// that hits `max_reset_duration_cols` — i.e. `"23h 59m"` (the `{d}h {d}m`
+/// branch with two-digit hours and two-digit minutes). Using `"3d 12h"` would
+/// understate the width by 1 column and miss the worst-case overflow.
+fn renderWorstCaseRateLimit(aw: *Writer.Allocating, cols: u16) ![]const u8 {
+    const reset_ms: i64 = (23 * 3600 + 59 * 60) * 1000; // now=0 → "23h 59m"
+    const info = StdinInfo{
+        .rate_limit_5h = .{ .used_percentage = 100.0, .resets_at_ms = reset_ms },
+        .rate_limit_7d = .{ .used_percentage = 100.0, .resets_at_ms = reset_ms },
+    };
+    var theme = theme_default;
+    const layout = layoutForColumns(cols);
+    theme.bar_width = layout.bar_width;
+    theme.reset_info = layout.reset_info;
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+    var last: []const u8 = "";
+    while (it.next()) |line| {
+        if (line.len > 0) last = line;
+    }
+    return last;
+}
+
+test "rate-limit line fits within COLUMNS at every breakpoint" {
+    // Tiers: bar shrinks (85..69), bar hidden full reset (68..63), duration only
+    // (62..39), nothing (38..23). Worst case = both windows, 100%, "23h 59m", date.
+    const widths = [_]u16{ 200, 85, 84, 81, 80, 77, 76, 73, 72, 69, 68, 63, 62, 39, 38, 23 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        const line = try renderWorstCaseRateLimit(&aw, cols);
+        try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+test "duration_only drops datetime but keeps duration" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const line = try renderWorstCaseRateLimit(&aw, 50);
+    try std.testing.expect(contains(line, "23h 59m")); // duration kept
+    try std.testing.expect(!contains(line, "/")); // no "MM/DD" datetime
+}
+
+test "none drops both duration and datetime" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const line = try renderWorstCaseRateLimit(&aw, 25);
+    try std.testing.expect(contains(line, "100%"));
+    try std.testing.expect(!contains(line, "23h 59m")); // duration gone
+    try std.testing.expect(!contains(line, "/")); // datetime gone
 }
