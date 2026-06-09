@@ -40,6 +40,10 @@ pub const ModelPricing = struct {
 };
 
 pub const pricing_table = [_]ModelPricing{
+    // Fable 5 (1M context at standard pricing)
+    .{ .prefix = "claude-fable-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
+    // Mythos 5 (limited availability; same rates as Fable 5)
+    .{ .prefix = "claude-mythos-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
     // Opus 4.7 (1M context at standard pricing; fast mode $30/$150 per MTok)
     .{
         .prefix = "claude-opus-4-7",
@@ -181,6 +185,31 @@ test "calculateEntryCost opus 4.8 fast mode uses explicit fast rates" {
     const cost = calculateEntryCost(p, usage);
     // 1000 * 1e-5 (fast.input) + 500 * 5e-5 (fast.output) = 0.01 + 0.025 = 0.035
     try std.testing.expectApproxEqAbs(@as(f64, 0.035), cost, 1e-10);
+}
+
+test "calculateEntryCost fable 5 all five rates" {
+    const p = findPricing("claude-fable-5[1m]").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 1000*10e-6 + 500*50e-6 + 2000*12.5e-6 + 3000*20e-6 + 4000*1e-6
+    // = 0.01 + 0.025 + 0.025 + 0.06 + 0.004 = 0.124
+    try std.testing.expectApproxEqAbs(@as(f64, 0.124), cost, 1e-10);
+}
+
+test "calculateEntryCost mythos 5 matches fable 5 rates" {
+    const fable = findPricing("claude-fable-5").?;
+    const mythos = findPricing("claude-mythos-5").?;
+    try std.testing.expectEqual(fable.input, mythos.input);
+    try std.testing.expectEqual(fable.output, mythos.output);
+    try std.testing.expectEqual(fable.cache_creation_5m, mythos.cache_creation_5m);
+    try std.testing.expectEqual(fable.cache_creation_1h, mythos.cache_creation_1h);
+    try std.testing.expectEqual(fable.cache_read, mythos.cache_read);
 }
 
 test "calculateEntryCost" {
@@ -421,6 +450,9 @@ test "calculateEntryCost sonnet 4.5 above 200k uses 1h premium rate" {
 
 test "findPricing all model prefixes" {
     const expected = [_]struct { model: []const u8, prefix: []const u8 }{
+        .{ .model = "claude-fable-5-20260601", .prefix = "claude-fable-5" },
+        .{ .model = "claude-fable-5[1m]", .prefix = "claude-fable-5" },
+        .{ .model = "claude-mythos-5[1m]", .prefix = "claude-mythos-5" },
         .{ .model = "claude-opus-4-8", .prefix = "claude-opus-4-8" },
         .{ .model = "claude-opus-4-7-20260101", .prefix = "claude-opus-4-7" },
         .{ .model = "claude-opus-4-6-20251212", .prefix = "claude-opus-4-6" },
