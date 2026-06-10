@@ -104,7 +104,7 @@ Generates synthetic JSONL transcripts at `/tmp/cc-statusline-bench/` (small / me
 | `fullScan`            | `scan.benchFullScan` only (parses every JSONL)           |
 | `parseJsonlContent`   | the JSONL parser on a single fixture file                |
 
-The harness saves the user's real cache to `/tmp/cc-statusline-cache.bin.bench-bak` while running and restores it on exit, so it does not pollute live statusline output.
+Child processes run with `CLAUDE_CONFIG_DIR=/tmp/cc-statusline-bench`, so the harness never touches the user's real config dir, cache, or live statusline output.
 
 Useful flags (pass after `--`):
 

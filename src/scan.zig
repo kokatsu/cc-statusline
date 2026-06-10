@@ -21,7 +21,7 @@ const TokenUsage = pricing.TokenUsage;
 /// negligible at observed scan sizes (~10^5 UUID-pair entries).
 pub const DedupSet = std.AutoHashMapUnmanaged(u64, void);
 
-pub const cache_path = "/tmp/cc-statusline-cache.bin";
+pub const cache_name = "statusline-cache.bin";
 const cache_ttl_s: i64 = 30;
 const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
@@ -74,10 +74,15 @@ const CacheResult = struct {
 // ============================================================
 
 fn resolveConfigDir(allocator: std.mem.Allocator, claude_config_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {
+    // A relative dir would feed the *Absolute file APIs downstream: assert
+    // failure in Debug, cwd-relative I/O in ReleaseFast. Reject it here so the
+    // statusline degrades to "no scan data" instead.
     if (claude_config_dir) |dir| {
+        if (!std.fs.path.isAbsolute(dir)) return error.RelativeConfigDir;
         return try allocator.dupe(u8, dir);
     }
     const h = home orelse return error.NoHome;
+    if (!std.fs.path.isAbsolute(h)) return error.RelativeConfigDir;
     return try std.fmt.allocPrint(allocator, "{s}/.claude", .{h});
 }
 
@@ -742,8 +747,8 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_
     };
 }
 
-fn readCache(allocator: std.mem.Allocator, day_start_ms: i64) ?CacheResult {
-    var f = Io.Dir.openFileAbsolute(g_io, cache_path, .{}) catch return null;
+fn readCache(allocator: std.mem.Allocator, day_start_ms: i64, cp: []const u8) ?CacheResult {
+    var f = Io.Dir.openFileAbsolute(g_io, cp, .{}) catch return null;
     defer f.close(g_io);
     var rbuf: [4096]u8 = undefined;
     var reader = f.readerStreaming(g_io, &rbuf);
@@ -784,28 +789,43 @@ fn serializeCacheBytes(w: anytype, result: ScanResult, files: []const CachedFile
     }
 }
 
-fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64) void {
-    const tmp_path = cache_path ++ ".tmp";
-    var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{}) catch return;
+fn logWriteCacheError(path: []const u8, err: anyerror) void {
+    // A missing config dir is expected when Claude Code has never run — stay
+    // silent. Permission / I/O errors mean caching is silently disabled (every
+    // render pays a full scan), so surface them for debugging.
+    if (err == error.FileNotFound) return;
+    var buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "cc-statusline: write cache {s} failed: {s}\n", .{ path, @errorName(err) })) |msg| {
+        Io.File.stderr().writeStreamingAll(g_io, msg) catch {};
+    } else |_| {}
+}
+
+fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, cp: []const u8) void {
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{cp}) catch return;
+    var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{}) catch |err| {
+        logWriteCacheError(tmp_path, err);
+        return;
+    };
     defer f.close(g_io);
     var wbuf: [8192]u8 = undefined;
     var writer = f.writerStreaming(g_io, &wbuf);
     serializeCacheBytes(&writer.interface, result, files, now_s, last_full_scan_s, day_start_ms) catch return;
     writer.interface.flush() catch return;
-    Io.Dir.renameAbsolute(tmp_path, cache_path, g_io) catch {};
+    Io.Dir.renameAbsolute(tmp_path, cp, g_io) catch |err| logWriteCacheError(cp, err);
 }
 
 // ============================================================
 // Scan Orchestration
 // ============================================================
 
-/// Bench-only entry that bypasses cache and forces a full scan from `projects_path`.
-/// `cc-statusline` itself goes through `scanTranscripts`; benches use this to measure
-/// the cold path in isolation without touching the on-disk cache.
-pub fn benchFullScan(io: Io, allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, day_start_ms: i64) ScanResult {
+/// Bench-only entry that bypasses the cache read and forces a full scan from
+/// `projects_path`. Note it still writes the cache to `cp` — benches pass a
+/// sandbox path. `cc-statusline` itself goes through `scanTranscripts`.
+pub fn benchFullScan(io: Io, allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, day_start_ms: i64, cp: []const u8) ScanResult {
     g_io = io;
     const now_s = @divFloor(now_ms, @as(i64, 1000));
-    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, null);
+    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, null, cp);
 }
 
 /// Phases of `benchFullScanProfiled`. Used as both a label source and an index
@@ -836,6 +856,7 @@ pub fn benchFullScanProfiled(
     now_ms: i64,
     day_start_ms: i64,
     timings: *PhaseTimings,
+    cp: []const u8,
 ) ScanResult {
     g_io = io;
     const now_s = @divFloor(now_ms, @as(i64, 1000));
@@ -907,7 +928,7 @@ pub fn benchFullScanProfiled(
 
     ts = Io.Clock.awake.now(io);
     const cf = cache_files.toOwnedSlice(allocator) catch &.{};
-    writeCache(result, cf, now_s, now_s, day_start_ms);
+    writeCache(result, cf, now_s, now_s, day_start_ms, cp);
     timings[@intFromEnum(Phase.write_cache)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
 
     return result;
@@ -917,27 +938,28 @@ pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: s
     g_io = io;
     const config_dir = getConfigDir(allocator, env) catch return null;
     const projects_path = std.fmt.allocPrint(allocator, "{s}/projects", .{config_dir}) catch return null;
+    const cp = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, cache_name }) catch return null;
     const now_s = @divFloor(now_ms, @as(i64, 1000));
 
     // Try cache — TTL check before any I/O
-    if (readCache(allocator, day_start_ms)) |cached| {
+    if (readCache(allocator, day_start_ms, cp)) |cached| {
         if (now_s - cached.write_time_s <= cache_ttl_s) {
             return cached.scan;
         }
         // TTL expired, but file list is still fresh — try stat-only diff
         if (now_s - cached.last_full_scan_s <= file_list_ttl_s and cached.files.len > 0) {
-            if (diffScan(allocator, cached, now_ms, now_s, day_start_ms, resets_at_ms)) |result| {
+            if (diffScan(allocator, cached, now_ms, now_s, day_start_ms, resets_at_ms, cp)) |result| {
                 return result;
             }
         }
     }
 
-    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, resets_at_ms);
+    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, resets_at_ms, cp);
 }
 
 /// Stat-only diff scan: check cached files for size changes, parse only new bytes.
 /// Returns null if any file shrank/disappeared (caller should fall back to full scan).
-fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64) ?ScanResult {
+fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64, cp: []const u8) ?ScanResult {
     // If resets_at changed since cache was written, the block window shifted — need full rescan
     if (resets_at_ms) |reset_ms| {
         if (cached.scan.block) |existing_block| {
@@ -970,7 +992,7 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
     if (any_shrunk) return null;
 
     if (changed.count() == 0) {
-        writeCache(cached.scan, cached.files, now_s, cached.last_full_scan_s, day_start_ms);
+        writeCache(cached.scan, cached.files, now_s, cached.last_full_scan_s, day_start_ms, cp);
         return cached.scan;
     }
 
@@ -1048,11 +1070,11 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
         .block = block,
     };
     const new_file_entries = new_files.toOwnedSlice(allocator) catch cached.files;
-    writeCache(result, new_file_entries, now_s, cached.last_full_scan_s, day_start_ms);
+    writeCache(result, new_file_entries, now_s, cached.last_full_scan_s, day_start_ms, cp);
     return result;
 }
 
-fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64) ScanResult {
+fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64, cp: []const u8) ScanResult {
     const file_infos = collectTranscriptFiles(allocator, projects_path, now_ms);
     var all_entries: std.ArrayList(TranscriptEntry) = .empty;
     var cache_files: std.ArrayList(CachedFileEntry) = .empty;
@@ -1102,7 +1124,7 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
         .block = computeBlock(all_entries.items, now_ms, resets_at_ms),
     };
     const cf = cache_files.toOwnedSlice(allocator) catch &.{};
-    writeCache(result, cf, now_s, now_s, day_start_ms);
+    writeCache(result, cf, now_s, now_s, day_start_ms, cp);
     return result;
 }
 
@@ -1412,6 +1434,14 @@ test "resolveConfigDir no HOME returns error" {
     try std.testing.expectError(error.NoHome, resolveConfigDir(std.testing.allocator, null, null));
 }
 
+test "resolveConfigDir rejects relative CLAUDE_CONFIG_DIR" {
+    try std.testing.expectError(error.RelativeConfigDir, resolveConfigDir(std.testing.allocator, ".claude", null));
+}
+
+test "resolveConfigDir rejects relative HOME" {
+    try std.testing.expectError(error.RelativeConfigDir, resolveConfigDir(std.testing.allocator, null, "relative/home"));
+}
+
 // --- parseJsonlContent (skip branches) ---
 
 test "parseJsonlContent skips invalid json with input_tokens" {
@@ -1518,6 +1548,8 @@ fn removeTmpFile(path: []const u8) void {
     Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
 }
 
+const test_cache_path = "/tmp/cc-test-cache.bin";
+
 fn statFileSize(path: []const u8) i64 {
     const stat = Io.Dir.cwd().statFile(std.testing.io, path, .{}) catch return 0;
     return @intCast(stat.size);
@@ -1550,7 +1582,8 @@ test "diffScan no files changed returns cached result" {
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null);
+    defer removeTmpFile(test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path);
     try std.testing.expect(result != null);
     try std.testing.expectApproxEqAbs(@as(f64, 5.0), result.?.today_cost, 1e-10);
 }
@@ -1578,7 +1611,7 @@ test "diffScan file shrank returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path));
 }
 
 test "diffScan file disappeared returns null" {
@@ -1600,7 +1633,7 @@ test "diffScan file disappeared returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path));
 }
 
 test "diffScan resets_at changed returns null" {
@@ -1630,7 +1663,7 @@ test "diffScan resets_at changed returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, test_cache_path));
 }
 
 test "diffScan file grew recalculates cost" {
@@ -1663,7 +1696,8 @@ test "diffScan file grew recalculates cost" {
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null);
+    defer removeTmpFile(test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path);
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.today_cost > 1.0);
 }
@@ -1695,7 +1729,8 @@ test "diffScan total_diff_cost zero preserves cached block" {
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null);
+    defer removeTmpFile(test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path);
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.block != null);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.?.block.?.cost, 1e-10);
@@ -1741,7 +1776,7 @@ test "diffScan falls through to fullScan when cached block is null and new entri
 
     try std.testing.expectEqual(
         @as(?ScanResult, null),
-        diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms),
+        diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, test_cache_path),
     );
 }
 
@@ -1773,7 +1808,8 @@ test "diffScan keeps cached null block when no files changed (no false fullScan)
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms);
+    defer removeTmpFile(test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, test_cache_path);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(?BlockInfo, null), result.?.block);
 }

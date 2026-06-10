@@ -28,7 +28,7 @@ const default_iters: u32 = 10;
 const warmup_iters: u32 = 3;
 
 const bench_root = "/tmp/cc-statusline-bench";
-const cache_backup = "/tmp/cc-statusline-cache.bin.bench-bak";
+const bench_cache_path = bench_root ++ "/" ++ scan.cache_name;
 
 // ─── Stats ─────────────────────────────────────────────────────────────────
 
@@ -246,27 +246,12 @@ fn loadFirstFixture(io: Io, allocator: std.mem.Allocator) ![]u8 {
 }
 
 // ─── Cache isolation ──────────────────────────────────────────────────────
+// The user's production cache needs no stashing: child processes run with
+// CLAUDE_CONFIG_DIR=bench_root (buildEnvMap), so their cache lands at
+// bench_cache_path, and in-process benches pass bench_cache_path explicitly.
 
-/// Move the user's cache aside so benches run cold without clobbering real data.
-/// Returns whether a stash actually happened; `restoreCache` keys off this so it
-/// never renames a missing backup over a live cache it failed to stash.
-/// Deletes any stale backup from a prior interrupted run first — otherwise the
-/// rename would fail with PathAlreadyExists and leave the live cache exposed.
-fn stashCache(io: Io) bool {
-    Io.Dir.deleteFileAbsolute(io, cache_backup) catch {};
-    Io.Dir.renameAbsolute(scan.cache_path, cache_backup, io) catch return false;
-    return true;
-}
-
-fn restoreCache(io: Io, stashed: bool) void {
-    Io.Dir.deleteFileAbsolute(io, scan.cache_path) catch {};
-    if (stashed) {
-        Io.Dir.renameAbsolute(cache_backup, scan.cache_path, io) catch {};
-    }
-}
-
-fn dropCache(io: Io) void {
-    Io.Dir.deleteFileAbsolute(io, scan.cache_path) catch {};
+fn dropCache(io: Io, cp: []const u8) void {
+    Io.Dir.deleteFileAbsolute(io, cp) catch {};
 }
 
 // ─── Macro bench: spawn cc-statusline ─────────────────────────────────────
@@ -316,10 +301,10 @@ fn drainPipe(io: Io, allocator: std.mem.Allocator, file: *Io.File) void {
 
 const RunMode = enum { cold, warm };
 
-fn benchEndToEnd(allocator: std.mem.Allocator, io: Io, exe_path: []const u8, env: *const std.process.Environ.Map, mode: RunMode, iters: u32) !Stats {
+fn benchEndToEnd(allocator: std.mem.Allocator, io: Io, exe_path: []const u8, env: *const std.process.Environ.Map, mode: RunMode, iters: u32, cp: []const u8) !Stats {
     if (mode == .warm) {
         // Prime the cache once before warm runs.
-        dropCache(io);
+        dropCache(io, cp);
         _ = try runOnce(io, allocator, exe_path, env);
     }
 
@@ -328,12 +313,12 @@ fn benchEndToEnd(allocator: std.mem.Allocator, io: Io, exe_path: []const u8, env
 
     var i: u32 = 0;
     while (i < warmup_iters) : (i += 1) {
-        if (mode == .cold) dropCache(io);
+        if (mode == .cold) dropCache(io, cp);
         _ = try runOnce(io, allocator, exe_path, env);
     }
     i = 0;
     while (i < iters) : (i += 1) {
-        if (mode == .cold) dropCache(io);
+        if (mode == .cold) dropCache(io, cp);
         samples[i] = try runOnce(io, allocator, exe_path, env);
     }
     return computeStats(samples);
@@ -350,14 +335,14 @@ fn benchFullScan(allocator: std.mem.Allocator, io: Io, projects_path: []const u8
     while (i < warmup_iters) : (i += 1) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        _ = scan.benchFullScan(io, arena.allocator(), projects_path, now_ms, day_start_ms);
+        _ = scan.benchFullScan(io, arena.allocator(), projects_path, now_ms, day_start_ms, bench_cache_path);
     }
     i = 0;
     while (i < iters) : (i += 1) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const start_ts = Io.Clock.awake.now(io);
-        _ = scan.benchFullScan(io, arena.allocator(), projects_path, now_ms, day_start_ms);
+        _ = scan.benchFullScan(io, arena.allocator(), projects_path, now_ms, day_start_ms, bench_cache_path);
         samples[i] = @intCast(start_ts.untilNow(io, .awake).nanoseconds);
     }
     return computeStats(samples);
@@ -382,14 +367,14 @@ fn benchFullScanProfiled(allocator: std.mem.Allocator, io: Io, projects_path: []
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var t: scan.PhaseTimings = @splat(0);
-        _ = scan.benchFullScanProfiled(io, arena.allocator(), projects_path, now_ms, day_start_ms, &t);
+        _ = scan.benchFullScanProfiled(io, arena.allocator(), projects_path, now_ms, day_start_ms, &t, bench_cache_path);
     }
     i = 0;
     while (i < iters) : (i += 1) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         var t: scan.PhaseTimings = @splat(0);
-        _ = scan.benchFullScanProfiled(io, arena.allocator(), projects_path, now_ms, day_start_ms, &t);
+        _ = scan.benchFullScanProfiled(io, arena.allocator(), projects_path, now_ms, day_start_ms, &t, bench_cache_path);
         for (&samples, t) |*s, ns| s.*[i] = ns;
     }
 
@@ -715,9 +700,6 @@ pub fn main(init: std.process.Init) !void {
     var stdout_w = Io.File.stdout().writerStreaming(io, &stdout_buf);
     const out = &stdout_w.interface;
 
-    const stashed = stashCache(io);
-    defer restoreCache(io, stashed);
-
     const baseline = readBaseline(io, allocator);
 
     // env_map is allocated from the arena, so no explicit deinit is needed.
@@ -739,8 +721,8 @@ pub fn main(init: std.process.Init) !void {
         const fixture_stats = try writeFixtures(io, sz.files, sz.lines, now_ms);
         const content = try loadFirstFixture(io, allocator);
 
-        const e2e_cold = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .cold, default_iters);
-        const e2e_warm = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .warm, default_iters);
+        const e2e_cold = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .cold, default_iters, bench_cache_path);
+        const e2e_warm = try benchEndToEnd(allocator, io, args.exe_path, &env_map, .warm, default_iters, bench_cache_path);
         const fs_stats = try benchFullScan(allocator, io, projects_path, now_ms, day_start_ms, default_iters);
         const fs_phases = try benchFullScanProfiled(allocator, io, projects_path, now_ms, day_start_ms, default_iters);
         const pj_stats = try benchParseJsonl(allocator, io, content, default_iters);
