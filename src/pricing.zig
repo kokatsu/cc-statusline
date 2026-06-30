@@ -1,5 +1,6 @@
 const std = @import("std");
 const mem = std.mem;
+const time = @import("time.zig");
 
 const token_200k: i64 = 200_000;
 
@@ -21,6 +22,19 @@ pub const FastRates = struct {
     output: f64,
 };
 
+/// Temporary launch-window pricing that reverts to the standard rates above
+/// once `valid_until_ms` passes. Selected by the usage entry's own
+/// timestamp, not wall-clock time, so historical entries price correctly
+/// regardless of when the tool runs.
+pub const IntroRates = struct {
+    input: f64,
+    output: f64,
+    cache_creation_5m: f64,
+    cache_creation_1h: f64,
+    cache_read: f64,
+    valid_until_ms: i64,
+};
+
 pub const ModelPricing = struct {
     prefix: []const u8,
     input: f64,
@@ -37,6 +51,8 @@ pub const ModelPricing = struct {
     // standard rates (failsafe for non-fast-eligible models). Both input and
     // output are required when set — compile-time enforced by the struct.
     fast: ?FastRates = null,
+    // null means this model has no introductory pricing window.
+    intro: ?IntroRates = null,
 };
 
 pub const pricing_table = [_]ModelPricing{
@@ -82,6 +98,24 @@ pub const pricing_table = [_]ModelPricing{
     .{ .prefix = "claude-opus-4", .input = 15e-6, .output = 75e-6, .cache_creation_5m = 18.75e-6, .cache_creation_1h = 30e-6, .cache_read = 1.5e-6 },
     // Claude 3 Opus
     .{ .prefix = "claude-3-opus", .input = 15e-6, .output = 75e-6, .cache_creation_5m = 18.75e-6, .cache_creation_1h = 30e-6, .cache_read = 1.5e-6 },
+    // Sonnet 5 (1M context at standard pricing; introductory pricing $2/$10
+    // per MTok through 2026-08-31, then standard $3/$15)
+    .{
+        .prefix = "claude-sonnet-5",
+        .input = 3e-6,
+        .output = 15e-6,
+        .cache_creation_5m = 3.75e-6,
+        .cache_creation_1h = 6e-6,
+        .cache_read = 3e-7,
+        .intro = .{
+            .input = 2e-6,
+            .output = 10e-6,
+            .cache_creation_5m = 2.5e-6,
+            .cache_creation_1h = 4e-6,
+            .cache_read = 2e-7,
+            .valid_until_ms = time.daysFromCivil(2026, 9, 1) * 86400 * 1000,
+        },
+    },
     // Sonnet 4.6 (1M context at standard pricing)
     .{ .prefix = "claude-sonnet-4-6", .input = 3e-6, .output = 15e-6, .cache_creation_5m = 3.75e-6, .cache_creation_1h = 6e-6, .cache_read = 3e-7 },
     // Sonnet 4.5
@@ -134,21 +168,25 @@ pub fn staticPrefixOf(model: []const u8) []const u8 {
     return if (findPricing(model)) |p| p.prefix else "unknown";
 }
 
-pub fn calculateEntryCost(pricing: ModelPricing, usage: TokenUsage) f64 {
+pub fn calculateEntryCost(pricing: ModelPricing, usage: TokenUsage, timestamp_ms: i64) f64 {
     const cache_creation_total = usage.cache_creation_5m_input_tokens + usage.cache_creation_1h_input_tokens;
     const total_input = usage.input_tokens + cache_creation_total + usage.cache_read_input_tokens;
     // Fast mode takes precedence over the 200k tier per Anthropic docs:
     // "Fast mode pricing applies across the full context window, including requests over 200k input tokens."
     const fast = pricing.fast;
     const use_fast = usage.is_fast and fast != null;
-    const use_premium = !use_fast and total_input > token_200k and pricing.input_above_200k != null;
+    // Introductory pricing is keyed off the entry's own timestamp so historical
+    // usage still prices at the rate that was actually in effect when it ran.
+    const intro = pricing.intro;
+    const use_intro = !use_fast and intro != null and timestamp_ms < intro.?.valid_until_ms;
+    const use_premium = !use_fast and !use_intro and total_input > token_200k and pricing.input_above_200k != null;
 
     // Fast cache rates derived from fast input via standard Anthropic caching multipliers.
-    const input_rate = if (use_fast) fast.?.input else if (use_premium) pricing.input_above_200k.? else pricing.input;
-    const output_rate = if (use_fast) fast.?.output else if (use_premium) (pricing.output_above_200k orelse pricing.output) else pricing.output;
-    const cc5m_rate = if (use_fast) fast.?.input * 1.25 else if (use_premium) (pricing.cache_creation_5m_above_200k orelse pricing.cache_creation_5m) else pricing.cache_creation_5m;
-    const cc1h_rate = if (use_fast) fast.?.input * 2.0 else if (use_premium) (pricing.cache_creation_1h_above_200k orelse pricing.cache_creation_1h) else pricing.cache_creation_1h;
-    const cr_rate = if (use_fast) fast.?.input * 0.1 else if (use_premium) (pricing.cache_read_above_200k orelse pricing.cache_read) else pricing.cache_read;
+    const input_rate = if (use_fast) fast.?.input else if (use_intro) intro.?.input else if (use_premium) pricing.input_above_200k.? else pricing.input;
+    const output_rate = if (use_fast) fast.?.output else if (use_intro) intro.?.output else if (use_premium) (pricing.output_above_200k orelse pricing.output) else pricing.output;
+    const cc5m_rate = if (use_fast) fast.?.input * 1.25 else if (use_intro) intro.?.cache_creation_5m else if (use_premium) (pricing.cache_creation_5m_above_200k orelse pricing.cache_creation_5m) else pricing.cache_creation_5m;
+    const cc1h_rate = if (use_fast) fast.?.input * 2.0 else if (use_intro) intro.?.cache_creation_1h else if (use_premium) (pricing.cache_creation_1h_above_200k orelse pricing.cache_creation_1h) else pricing.cache_creation_1h;
+    const cr_rate = if (use_fast) fast.?.input * 0.1 else if (use_intro) intro.?.cache_read else if (use_premium) (pricing.cache_read_above_200k orelse pricing.cache_read) else pricing.cache_read;
 
     return @as(f64, @floatFromInt(usage.input_tokens)) * input_rate +
         @as(f64, @floatFromInt(usage.output_tokens)) * output_rate +
@@ -182,7 +220,7 @@ test "calculateEntryCost opus 4.8 fast mode uses explicit fast rates" {
         .output_tokens = 500,
         .is_fast = true,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // 1000 * 1e-5 (fast.input) + 500 * 5e-5 (fast.output) = 0.01 + 0.025 = 0.035
     try std.testing.expectApproxEqAbs(@as(f64, 0.035), cost, 1e-10);
 }
@@ -196,7 +234,7 @@ test "calculateEntryCost fable 5 all five rates" {
         .cache_creation_1h_input_tokens = 3000,
         .cache_read_input_tokens = 4000,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // 1000*10e-6 + 500*50e-6 + 2000*12.5e-6 + 3000*20e-6 + 4000*1e-6
     // = 0.01 + 0.025 + 0.025 + 0.06 + 0.004 = 0.124
     try std.testing.expectApproxEqAbs(@as(f64, 0.124), cost, 1e-10);
@@ -218,7 +256,7 @@ test "calculateEntryCost" {
         .input_tokens = 1000,
         .output_tokens = 500,
     };
-    const cost = calculateEntryCost(pricing, usage);
+    const cost = calculateEntryCost(pricing, usage, 0);
     try std.testing.expectApproxEqAbs(@as(f64, 0.0175), cost, 1e-10);
 }
 
@@ -228,7 +266,7 @@ test "calculateEntryCost tiered" {
         .input_tokens = 250_000,
         .output_tokens = 100,
     };
-    const cost = calculateEntryCost(pricing, usage);
+    const cost = calculateEntryCost(pricing, usage, 0);
     try std.testing.expectApproxEqAbs(@as(f64, 1.50225), cost, 1e-10);
 }
 
@@ -240,7 +278,7 @@ test "calculateEntryCost opus 4.6 with cache over 200k uses base rate" {
         .cache_creation_5m_input_tokens = 100_000,
         .cache_read_input_tokens = 100_000,
     };
-    const cost = calculateEntryCost(pricing, usage);
+    const cost = calculateEntryCost(pricing, usage, 0);
     // total_input = 250k > 200k, but Opus 4.6 has no above_200k pricing
     // base rate: 50_000 * 5e-6 + 10_000 * 25e-6 + 100_000 * 6.25e-6 + 100_000 * 5e-7
     // = 0.25 + 0.25 + 0.625 + 0.05 = 1.175
@@ -255,7 +293,7 @@ test "calculateEntryCost under 200k with cache uses base rate" {
         .cache_creation_5m_input_tokens = 80_000,
         .cache_read_input_tokens = 60_000,
     };
-    const cost = calculateEntryCost(pricing, usage);
+    const cost = calculateEntryCost(pricing, usage, 0);
     try std.testing.expectApproxEqAbs(@as(f64, 0.905), cost, 1e-10);
 }
 
@@ -266,7 +304,7 @@ test "calculateEntryCost exactly 200k uses base rate" {
         .input_tokens = 200_000,
         .output_tokens = 100,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // base rate: 200_000 * 3e-6 + 100 * 15e-6 = 0.6 + 0.0015 = 0.6015
     try std.testing.expectApproxEqAbs(@as(f64, 0.6015), cost, 1e-10);
 }
@@ -278,7 +316,7 @@ test "calculateEntryCost 200k+1 uses premium rate" {
         .input_tokens = 200_001,
         .output_tokens = 100,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // premium rate: 200_001 * 6e-6 + 100 * 22.5e-6 = 1.200006 + 0.00225 = 1.202256
     try std.testing.expectApproxEqAbs(@as(f64, 1.202256), cost, 1e-10);
 }
@@ -290,7 +328,7 @@ test "calculateEntryCost opus 4.6 over 200k uses base rate" {
         .input_tokens = 300_000,
         .output_tokens = 1000,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // base rate: 300_000 * 5e-6 + 1000 * 25e-6 = 1.5 + 0.025 = 1.525
     try std.testing.expectApproxEqAbs(@as(f64, 1.525), cost, 1e-10);
 }
@@ -302,7 +340,7 @@ test "calculateEntryCost sonnet 4.6 over 200k uses base rate" {
         .input_tokens = 300_000,
         .output_tokens = 1000,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // base rate: 300_000 * 3e-6 + 1000 * 15e-6 = 0.9 + 0.015 = 0.915
     try std.testing.expectApproxEqAbs(@as(f64, 0.915), cost, 1e-10);
 }
@@ -314,7 +352,7 @@ test "calculateEntryCost opus 4.6 fast mode uses explicit fast rates" {
         .output_tokens = 500,
         .is_fast = true,
     };
-    const cost = calculateEntryCost(pricing, usage);
+    const cost = calculateEntryCost(pricing, usage, 0);
     // 1000 * 3e-5 (fast.input) + 500 * 15e-5 (fast.output) = 0.03 + 0.075 = 0.105
     try std.testing.expectApproxEqAbs(@as(f64, 0.105), cost, 1e-10);
 }
@@ -328,7 +366,7 @@ test "calculateEntryCost fast mode with cache" {
         .cache_read_input_tokens = 3000,
         .is_fast = true,
     };
-    const cost = calculateEntryCost(pricing, usage);
+    const cost = calculateEntryCost(pricing, usage, 0);
     // 1000 * 3e-5 + 500 * 15e-5 + 2000 * 3.75e-5 + 3000 * 3e-6
     // = 0.03 + 0.075 + 0.075 + 0.009 = 0.189
     try std.testing.expectApproxEqAbs(@as(f64, 0.189), cost, 1e-10);
@@ -342,7 +380,7 @@ test "calculateEntryCost no above_200k model over 200k uses base rate" {
         .input_tokens = 250_000,
         .output_tokens = 100,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // use_premium is false because input_above_200k == null
     // base rate: 250_000 * 15e-6 + 100 * 75e-6 = 3.75 + 0.0075 = 3.7575
     try std.testing.expectApproxEqAbs(@as(f64, 3.7575), cost, 1e-10);
@@ -350,13 +388,13 @@ test "calculateEntryCost no above_200k model over 200k uses base rate" {
 
 test "calculateEntryCost all-zero usage returns zero" {
     const p = findPricing("claude-opus-4-6-20251212").?;
-    const cost = calculateEntryCost(p, .{});
+    const cost = calculateEntryCost(p, .{}, 0);
     try std.testing.expectApproxEqAbs(@as(f64, 0), cost, 1e-10);
 }
 
 test "calculateEntryCost output only no input" {
     const p = findPricing("claude-opus-4-6-20251212").?;
-    const cost = calculateEntryCost(p, .{ .output_tokens = 1000 });
+    const cost = calculateEntryCost(p, .{ .output_tokens = 1000 }, 0);
     // 0 + 1000 * 25e-6 = 0.025
     try std.testing.expectApproxEqAbs(@as(f64, 0.025), cost, 1e-10);
 }
@@ -383,10 +421,89 @@ test "calculateEntryCost fast takes precedence over above_200k tier" {
         .output_tokens = 100,
         .is_fast = true,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // Fast wins: 250_000 * 1e-5 + 100 * 5e-5 = 2.5 + 0.005 = 2.505
     // (Premium would give: 250_000 * 8e-6 + 100 * 40e-6 = 2.0 + 0.004 = 2.004 — would fail.)
     try std.testing.expectApproxEqAbs(@as(f64, 2.505), cost, 1e-10);
+}
+
+test "calculateEntryCost fast takes precedence over introductory pricing" {
+    // Synthetic model with both fast AND intro populated. Fast mode pricing
+    // applies across the full window per Anthropic's spec, so it must win
+    // even while the introductory window is still active.
+    const p = ModelPricing{
+        .prefix = "test-fast-intro",
+        .input = 5e-6,
+        .output = 25e-6,
+        .cache_creation_5m = 6.25e-6,
+        .cache_creation_1h = 10e-6,
+        .cache_read = 5e-7,
+        .fast = .{ .input = 1e-5, .output = 5e-5 },
+        .intro = .{ .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 2e-7, .valid_until_ms = 1_000_000 },
+    };
+    const usage = TokenUsage{ .input_tokens = 1000, .output_tokens = 500, .is_fast = true };
+    const cost = calculateEntryCost(p, usage, 0); // timestamp 0 is within the intro window too
+    // Fast wins: 1000 * 1e-5 + 500 * 5e-5 = 0.01 + 0.025 = 0.035
+    // (Intro would give: 1000 * 2e-6 + 500 * 10e-6 = 0.002 + 0.005 = 0.007 — would fail.)
+    try std.testing.expectApproxEqAbs(@as(f64, 0.035), cost, 1e-10);
+}
+
+test "calculateEntryCost introductory pricing takes precedence over above_200k tier" {
+    // Synthetic model with both intro AND above_200k populated, usage over
+    // 200k input. The introductory rate is a temporal override of the base
+    // rate and should win over the context-size tier.
+    const p = ModelPricing{
+        .prefix = "test-intro-premium",
+        .input = 5e-6,
+        .output = 25e-6,
+        .cache_creation_5m = 6.25e-6,
+        .cache_creation_1h = 10e-6,
+        .cache_read = 5e-7,
+        .input_above_200k = 8e-6,
+        .output_above_200k = 40e-6,
+        .intro = .{ .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 2e-7, .valid_until_ms = 1_000_000 },
+    };
+    const usage = TokenUsage{ .input_tokens = 250_000, .output_tokens = 100 };
+    const cost = calculateEntryCost(p, usage, 0);
+    // Intro wins: 250_000 * 2e-6 + 100 * 10e-6 = 0.5 + 0.001 = 0.501
+    // (Premium would give: 250_000 * 8e-6 + 100 * 40e-6 = 2.0 + 0.004 = 2.004 — would fail.)
+    try std.testing.expectApproxEqAbs(@as(f64, 0.501), cost, 1e-10);
+}
+
+test "calculateEntryCost sonnet 5 before cutoff uses introductory rates" {
+    const p = findPricing("claude-sonnet-5").?;
+    const cutoff = p.intro.?.valid_until_ms;
+    const usage = TokenUsage{ .input_tokens = 1000, .output_tokens = 500 };
+    const cost = calculateEntryCost(p, usage, cutoff - 1);
+    // 1000 * 2e-6 (intro input) + 500 * 10e-6 (intro output) = 0.002 + 0.005 = 0.007
+    try std.testing.expectApproxEqAbs(@as(f64, 0.007), cost, 1e-10);
+}
+
+test "calculateEntryCost sonnet 5 at cutoff uses standard rates" {
+    const p = findPricing("claude-sonnet-5").?;
+    const cutoff = p.intro.?.valid_until_ms;
+    const usage = TokenUsage{ .input_tokens = 1000, .output_tokens = 500 };
+    const cost = calculateEntryCost(p, usage, cutoff);
+    // 1000 * 3e-6 (standard input) + 500 * 15e-6 (standard output) = 0.003 + 0.0075 = 0.0105
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0105), cost, 1e-10);
+}
+
+test "calculateEntryCost sonnet 5 introductory cache rates" {
+    const p = findPricing("claude-sonnet-5").?;
+    const cutoff = p.intro.?.valid_until_ms;
+    const usage = TokenUsage{
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage, cutoff - 1);
+    // 2000*2.5e-6 + 3000*4e-6 + 4000*2e-7 = 0.005 + 0.012 + 0.0008 = 0.0178
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0178), cost, 1e-10);
+}
+
+test "findPricing sonnet 5 intro cutoff is 2026-09-01 UTC" {
+    const p = findPricing("claude-sonnet-5").?;
+    try std.testing.expectEqual(time.daysFromCivil(2026, 9, 1) * 86400 * 1000, p.intro.?.valid_until_ms);
 }
 
 test "calculateEntryCost is_fast on non-fast model falls back to standard rates" {
@@ -401,7 +518,7 @@ test "calculateEntryCost is_fast on non-fast model falls back to standard rates"
         .output_tokens = 100,
         .is_fast = true,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // 250_000 * 6e-6 (premium input) + 100 * 22.5e-6 (premium output) = 1.5 + 0.00225 = 1.50225
     try std.testing.expectApproxEqAbs(@as(f64, 1.50225), cost, 1e-10);
 }
@@ -413,7 +530,7 @@ test "calculateEntryCost 1h cache charges 1h rate on opus 4.6" {
         .output_tokens = 0,
         .cache_creation_1h_input_tokens = 10_000,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // 10_000 * 10e-6 = 0.1
     try std.testing.expectApproxEqAbs(@as(f64, 0.1), cost, 1e-10);
 }
@@ -427,7 +544,7 @@ test "calculateEntryCost mixed 5m + 1h cache on sonnet 4.6" {
         .cache_creation_1h_input_tokens = 3000,
         .cache_read_input_tokens = 4000,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // 1000*3e-6 + 500*15e-6 + 2000*3.75e-6 + 3000*6e-6 + 4000*3e-7
     // = 0.003 + 0.0075 + 0.0075 + 0.018 + 0.0012 = 0.0372
     try std.testing.expectApproxEqAbs(@as(f64, 0.0372), cost, 1e-10);
@@ -440,7 +557,7 @@ test "calculateEntryCost sonnet 4.5 above 200k uses 1h premium rate" {
         .output_tokens = 0,
         .cache_creation_1h_input_tokens = 10_000,
     };
-    const cost = calculateEntryCost(p, usage);
+    const cost = calculateEntryCost(p, usage, 0);
     // total_input = 260k > 200k → premium
     // 250_000 * 6e-6 + 10_000 * 12e-6 = 1.5 + 0.12 = 1.62
     try std.testing.expectApproxEqAbs(@as(f64, 1.62), cost, 1e-10);
@@ -460,6 +577,7 @@ test "findPricing all model prefixes" {
         .{ .model = "claude-opus-4-1-20250929", .prefix = "claude-opus-4-1" },
         .{ .model = "claude-opus-4-20250929", .prefix = "claude-opus-4" },
         .{ .model = "claude-3-opus-20240229", .prefix = "claude-3-opus" },
+        .{ .model = "claude-sonnet-5", .prefix = "claude-sonnet-5" },
         .{ .model = "claude-sonnet-4-6-20251212", .prefix = "claude-sonnet-4-6" },
         .{ .model = "claude-sonnet-4-5-20250929", .prefix = "claude-sonnet-4-5" },
         .{ .model = "claude-sonnet-4-3-20250929", .prefix = "claude-sonnet-4" },
@@ -486,6 +604,11 @@ test "findPricing prefix ordering specific sonnet-4 variants before generic sonn
     try std.testing.expectEqualStrings("claude-sonnet-4-6", findPricing("claude-sonnet-4-6-20251212").?.prefix);
     try std.testing.expectEqualStrings("claude-sonnet-4-5", findPricing("claude-sonnet-4-5-20250929").?.prefix);
     try std.testing.expectEqualStrings("claude-sonnet-4", findPricing("claude-sonnet-4-3-20250929").?.prefix);
+}
+
+test "findPricing sonnet-5 and sonnet-4 do not collide" {
+    try std.testing.expectEqualStrings("claude-sonnet-5", findPricing("claude-sonnet-5-20260615").?.prefix);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", findPricing("claude-sonnet-4-6-20251212").?.prefix);
 }
 
 test "findPricing prefix ordering specific opus-4 variants before generic opus-4" {

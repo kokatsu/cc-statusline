@@ -12,7 +12,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown
 - **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
-- **Pricing** — Supports Fable 5, Mythos 5, Opus 4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
+- **Pricing** — Supports Fable 5, Mythos 5, Opus 4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 5/4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing, per-model fast mode rates, and introductory pricing windows)
 - **Theming** — Built-in Catppuccin Mocha theme, fully customizable via environment variables
 
 ## Requirements

@@ -566,7 +566,7 @@ fn parseJsonlLine(
 
 fn entryCost(entry: TranscriptEntry) f64 {
     const p = pricing.findPricing(entry.model) orelse return 0;
-    return pricing.calculateEntryCost(p, entry.usage);
+    return pricing.calculateEntryCost(p, entry.usage, entry.timestamp_ms);
 }
 
 fn computeBurnRate(cost: f64, start_ms: i64, now_ms: i64) f64 {
@@ -1180,7 +1180,7 @@ test "computeCosts today entries only" {
     const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
     const result = computeCosts(&entries, now_ms, day_start_ms, null);
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_today = pricing.calculateEntryCost(p, today_entry.usage);
+    const expected_today = pricing.calculateEntryCost(p, today_entry.usage, today_entry.timestamp_ms);
     try std.testing.expectApproxEqAbs(expected_today, result.today_cost, 1e-10);
 }
 
@@ -1366,7 +1366,7 @@ test "computeBlockFromWindow entries within window" {
     try std.testing.expect(block != null);
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_cost = pricing.calculateEntryCost(p, inside.usage);
+    const expected_cost = pricing.calculateEntryCost(p, inside.usage, inside.timestamp_ms);
     try std.testing.expectApproxEqAbs(expected_cost, block.?.cost, 1e-10);
     try std.testing.expectEqual(window_start, block.?.start_ms);
     try std.testing.expectEqual(window_end, block.?.end_ms);
@@ -1412,7 +1412,7 @@ test "computeCosts with resets_at_ms uses window" {
     try std.testing.expectEqual(resets_at_ms, result.block.?.end_ms);
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_cost = pricing.calculateEntryCost(p, in_window.usage);
+    const expected_cost = pricing.calculateEntryCost(p, in_window.usage, in_window.timestamp_ms);
     try std.testing.expectApproxEqAbs(expected_cost, result.block.?.cost, 1e-10);
 }
 
@@ -1892,7 +1892,7 @@ test "identifyActiveBlock identical timestamps" {
     try std.testing.expect(block != null);
     // Both entries in same block, costs should be combined
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, entries[0].usage) + pricing.calculateEntryCost(p, entries[1].usage);
+    const expected = pricing.calculateEntryCost(p, entries[0].usage, entries[0].timestamp_ms) + pricing.calculateEntryCost(p, entries[1].usage, entries[1].timestamp_ms);
     try std.testing.expectApproxEqAbs(expected, block.?.cost, 1e-10);
 }
 
@@ -1909,7 +1909,7 @@ test "identifyActiveBlock exactly at block duration stays in block" {
     try std.testing.expect(block != null);
     // Both entries should be in the same block since condition is `>`
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, entries[0].usage) + pricing.calculateEntryCost(p, entries[1].usage);
+    const expected = pricing.calculateEntryCost(p, entries[0].usage, entries[0].timestamp_ms) + pricing.calculateEntryCost(p, entries[1].usage, entries[1].timestamp_ms);
     try std.testing.expectApproxEqAbs(expected, block.?.cost, 1e-10);
 }
 
@@ -1950,7 +1950,7 @@ test "identifyActiveBlock multiple gaps picks last block" {
     try std.testing.expect(block != null);
     // Only the last entry should be in the block
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 3000, .output_tokens = 1500 });
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 3000, .output_tokens = 1500 }, entries[2].timestamp_ms);
     try std.testing.expectApproxEqAbs(expected, block.?.cost, 1e-10);
 }
 
