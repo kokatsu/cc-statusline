@@ -17,9 +17,28 @@ const TokenUsage = pricing.TokenUsage;
 // Constants
 // ============================================================
 
-/// Per-scan dedup set keyed by Wyhash(msg_id ":" req_id). Collisions are
+/// Per-scan dedup map keyed by Wyhash(msg_id ":" req_id). Collisions are
 /// negligible at observed scan sizes (~10^5 UUID-pair entries).
-pub const DedupSet = std.AutoHashMapUnmanaged(u64, void);
+///
+/// Streaming writes several transcript lines per (msg_id, req_id) where the
+/// intermediate lines carry a placeholder output_tokens and only the final
+/// line the real count, so each slot remembers where the message's entry
+/// landed and a later duplicate from the same entries list overwrites it
+/// (keep-last). `gen` identifies the caller's entries list — bumped once per
+/// `parseJsonlReader` call — so a slot's index is never dereferenced into a
+/// different list; a cross-list duplicate (copied session file) keeps the
+/// existing entry instead.
+pub const DedupSet = struct {
+    const Slot = struct { gen: u32, index: u32 };
+    /// Sentinel index for a key claimed by a line that produced no entry
+    /// (missing usage or timestamp).
+    const no_entry = std.math.maxInt(u32);
+
+    map: std.AutoHashMapUnmanaged(u64, Slot) = .empty,
+    gen: u32 = 0,
+
+    pub const empty: DedupSet = .{};
+};
 
 pub const cache_name = "statusline-cache.bin";
 const cache_ttl_s: i64 = 30;
@@ -27,7 +46,7 @@ const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
 
 const cache_magic = [4]u8{ 'C', 'C', 'S', 'L' };
-const cache_ver: u32 = 5;
+const cache_ver: u32 = 7;
 const file_list_ttl_s: i64 = 300;
 // Actual caches are ~tens of KB; cap at 1 MiB to fail fast on corruption.
 const cache_max_bytes: usize = 1 * 1024 * 1024;
@@ -52,13 +71,42 @@ pub const TranscriptEntry = struct {
     timestamp_ms: i64,
     model: []const u8,
     usage: TokenUsage,
+    /// Wyhash(msg_id ":" req_id), or 0 when the line carried no id pair.
+    /// Lets scans that consume the entries later (tail bookkeeping in
+    /// diffScan) refer back to the message without re-parsing the line.
+    dedup_hash: u64 = 0,
 };
+
+/// Snapshot of a recently parsed entry, persisted in the cache per file so a
+/// later diff scan can *replace* a streaming message whose finalized usage
+/// line lands after the cache was written, instead of double-counting it.
+const TailEntry = struct {
+    hash: u64,
+    timestamp_ms: i64,
+    cost: f64,
+};
+
+/// Trailing unique messages remembered per file. Streaming duplicates only
+/// ever target the currently active message(s) — the newest by timestamp;
+/// 16 leaves ample slack for interleaved sidechain writes.
+const tail_max = 16;
+
+/// Maximum tolerated timestamp regression in a file's appended lines before
+/// diffScan falls back to a full scan. A regression beyond this means history
+/// was replayed into the file (session rewind/branch re-appends old messages
+/// verbatim, keeping their original timestamps) — those duplicates reach
+/// arbitrarily far back, beyond any bounded tail, so only a full scan dedups
+/// them correctly. Sub-minute jitter from interleaved writers is tolerated.
+const replay_slack_ms: i64 = 60 * 1000;
 
 const CachedFileEntry = struct {
     path: []const u8,
     file_size: i64,
     per_file_cost: f64,
     parsed_size: i64,
+    /// Newest entry timestamp counted for this file; 0 when no entry yet.
+    last_entry_ts: i64 = 0,
+    tail: []const TailEntry = &.{},
 };
 
 const CacheResult = struct {
@@ -181,6 +229,9 @@ pub fn parseJsonlReader(
     entries: *std.ArrayList(TranscriptEntry),
     seen: *DedupSet,
 ) void {
+    // Each reader call parses into a fresh entries list; the bump lets dedup
+    // slots tell same-list duplicates (overwrite) from cross-list ones (skip).
+    seen.gen +%= 1;
     while (true) {
         const line_opt = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
@@ -533,20 +584,31 @@ fn parseJsonlLine(
     // Dedup runs before timestamp/usage validation: a line missing timestamp
     // still claims its dedup key. Preserves the previous DOM parser's ordering
     // so out-of-band scans see the same set of unique entries.
+    // No map mutation happens after getOrPut, so the slot pointer stays valid.
+    var slot: ?*DedupSet.Slot = null;
+    var dedup_hash: u64 = 0;
     if (p.msg_id) |mid| if (p.req_id) |rid| {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(mid);
         hasher.update(":");
         hasher.update(rid);
-        const gop = try seen.getOrPut(dedup_alloc, hasher.final());
-        if (gop.found_existing) return;
+        dedup_hash = hasher.final();
+        const gop = try seen.map.getOrPut(dedup_alloc, dedup_hash);
+        if (gop.found_existing) {
+            // Duplicate from a different entries list (copied session file):
+            // keep the existing entry; the slot's index points elsewhere.
+            if (gop.value_ptr.gen != seen.gen) return;
+        } else {
+            gop.value_ptr.* = .{ .gen = seen.gen, .index = DedupSet.no_entry };
+        }
+        slot = gop.value_ptr;
     };
 
     if (!p.have_usage) return;
     const ts_str = p.timestamp_str orelse return;
     const timestamp_ms = time.parseIso8601ToMs(ts_str) orelse return;
 
-    try entries.append(allocator, .{
+    const entry = TranscriptEntry{
         .timestamp_ms = timestamp_ms,
         .model = pricing.staticPrefixOf(p.model),
         .usage = .{
@@ -557,7 +619,19 @@ fn parseJsonlLine(
             .cache_read_input_tokens = p.cache_read,
             .is_fast = p.is_fast,
         },
-    });
+        .dedup_hash = dedup_hash,
+    };
+
+    // A same-list duplicate carries a fresher usage snapshot — the final
+    // streaming line has the finalized output_tokens — so replace in place.
+    if (slot) |s| {
+        if (s.index != DedupSet.no_entry) {
+            entries.items[s.index] = entry;
+            return;
+        }
+    }
+    try entries.append(allocator, entry);
+    if (slot) |s| s.index = @intCast(entries.items.len - 1);
 }
 
 // ============================================================
@@ -567,6 +641,73 @@ fn parseJsonlLine(
 fn entryCost(entry: TranscriptEntry) f64 {
     const p = pricing.findPricing(entry.model) orelse return 0;
     return pricing.calculateEntryCost(p, entry.usage, entry.timestamp_ms);
+}
+
+/// Build the cache tail for one file: the `tail_max` unique messages with the
+/// newest timestamps among `old_tail` (a previous scan's tail) and `entries`
+/// (this scan's parse of the same file). A hash appearing in both — the
+/// finalized snapshot of a message counted earlier — keeps the newest value.
+///
+/// Selection is by timestamp, not slot position: keep-last dedup overwrites a
+/// streaming message's original slot in place, so by position it could sit
+/// arbitrarily early in `entries` while still being the most recently active
+/// message. Its overwritten timestamp is the latest snapshot's, which keeps
+/// it in the tail regardless of where it landed.
+///
+/// Returns an allocator-owned slice, oldest-first; degrades to an empty tail
+/// on alloc failure (only cost: a later duplicate double-counts, which is the
+/// pre-tail behavior).
+fn buildTail(allocator: std.mem.Allocator, old_tail: []const TailEntry, entries: []const TranscriptEntry) []const TailEntry {
+    const Cand = struct { t: TailEntry, seq: u32 };
+    const S = struct {
+        fn older(a: Cand, b: Cand) bool {
+            if (a.t.timestamp_ms != b.t.timestamp_ms) return a.t.timestamp_ms < b.t.timestamp_ms;
+            return a.seq < b.seq;
+        }
+        fn lessThan(_: void, a: Cand, b: Cand) bool {
+            return older(a, b);
+        }
+    };
+
+    // Newest value per hash: `entries` values overwrite `old_tail` values.
+    var map: std.AutoHashMapUnmanaged(u64, Cand) = .empty;
+    defer map.deinit(allocator);
+    var seq: u32 = 0;
+    for (old_tail) |t| {
+        map.put(allocator, t.hash, .{ .t = t, .seq = seq }) catch return &.{};
+        seq += 1;
+    }
+    for (entries) |e| {
+        if (e.dedup_hash == 0) continue;
+        map.put(allocator, e.dedup_hash, .{
+            .t = .{ .hash = e.dedup_hash, .timestamp_ms = e.timestamp_ms, .cost = entryCost(e) },
+            .seq = seq,
+        }) catch return &.{};
+        seq += 1;
+    }
+
+    // Keep the tail_max newest by (timestamp, insertion order).
+    var buf: [tail_max]Cand = undefined;
+    var n: usize = 0;
+    var it = map.valueIterator();
+    while (it.next()) |c| {
+        if (n < tail_max) {
+            buf[n] = c.*;
+            n += 1;
+            continue;
+        }
+        var min_i: usize = 0;
+        for (buf[0..n], 0..) |b, i| {
+            if (S.older(b, buf[min_i])) min_i = i;
+        }
+        if (S.older(buf[min_i], c.*)) buf[min_i] = c.*;
+    }
+    if (n == 0) return &.{};
+
+    std.mem.sort(Cand, buf[0..n], {}, S.lessThan);
+    const out = allocator.alloc(TailEntry, n) catch return &.{};
+    for (out, 0..) |*t, j| t.* = buf[j].t;
+    return out;
 }
 
 fn computeBurnRate(cost: f64, start_ms: i64, now_ms: i64) f64 {
@@ -726,15 +867,31 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_
         if (pos + path_len > content.len) break;
         const path = content[pos..][0..path_len];
         pos += path_len;
-        if (pos + 24 > content.len) break;
+        if (pos + 32 > content.len) break;
         const file_size = readVal(i64, content, &pos);
         const per_file_cost = readVal(f64, content, &pos);
         const parsed_size = readVal(i64, content, &pos);
+        const last_entry_ts = readVal(i64, content, &pos);
+        if (pos + 2 > content.len) break;
+        const tail_len = readVal(u16, content, &pos);
+        if (pos + @as(usize, tail_len) * 24 > content.len) break;
+        var tail: []const TailEntry = &.{};
+        if (tail_len > 0) {
+            const buf = allocator.alloc(TailEntry, tail_len) catch break;
+            for (buf) |*t| {
+                t.hash = readVal(u64, content, &pos);
+                t.timestamp_ms = readVal(i64, content, &pos);
+                t.cost = readVal(f64, content, &pos);
+            }
+            tail = buf;
+        }
         files.append(allocator, .{
             .path = path,
             .file_size = file_size,
             .per_file_cost = per_file_cost,
             .parsed_size = parsed_size,
+            .last_entry_ts = last_entry_ts,
+            .tail = tail,
         }) catch break;
     }
 
@@ -786,6 +943,13 @@ fn serializeCacheBytes(w: anytype, result: ScanResult, files: []const CachedFile
         try writeVal(w, entry.file_size);
         try writeVal(w, entry.per_file_cost);
         try writeVal(w, entry.parsed_size);
+        try writeVal(w, entry.last_entry_ts);
+        try writeVal(w, @as(u16, @intCast(entry.tail.len)));
+        for (entry.tail) |t| {
+            try writeVal(w, t.hash);
+            try writeVal(w, t.timestamp_ms);
+            try writeVal(w, t.cost);
+        }
     }
 }
 
@@ -902,10 +1066,12 @@ pub fn benchFullScanProfiled(
         ts = Io.Clock.awake.now(io);
         const new_items = all_entries.items[start_idx..];
         var per_cost: f64 = 0;
+        var last_ts: i64 = 0;
         for (new_items) |entry| {
             if (entry.timestamp_ms >= day_start_ms) {
                 per_cost += entryCost(entry);
             }
+            if (entry.timestamp_ms > last_ts) last_ts = entry.timestamp_ms;
         }
         total_today_cost += per_cost;
         // Bookkeeping inside `cost` so the seven phase counters cleanly
@@ -915,6 +1081,8 @@ pub fn benchFullScanProfiled(
             .file_size = fi.size,
             .per_file_cost = per_cost,
             .parsed_size = fi.size,
+            .last_entry_ts = last_ts,
+            .tail = buildTail(allocator, &.{}, new_items),
         }) catch {};
         timings[@intFromEnum(Phase.cost)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
     }
@@ -1022,13 +1190,42 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
                 parseJsonlReader(allocator, allocator, &reader.interface, &entries, &global_seen);
             }
 
+            // Appended lines regressing behind the file's newest counted entry
+            // mean history was replayed (session rewind/branch) — duplicates
+            // the bounded tail cannot cover. Fall back to a full scan, whose
+            // dedup collapses them correctly.
+            for (entries.items) |e| {
+                if (e.timestamp_ms < entry.last_entry_ts - replay_slack_ms) return null;
+            }
+
+            // Streaming messages straddle scan boundaries: the cached cost may
+            // include an intermediate snapshot whose finalized line only lands
+            // in these appended bytes. The cached tail lets that old
+            // contribution be subtracted — a replacement, not a double count.
+            // A failed put only degrades to the pre-tail double count.
+            var tail_map: std.AutoHashMapUnmanaged(u64, TailEntry) = .empty;
+            for (entry.tail) |t| tail_map.put(allocator, t.hash, t) catch {};
+
             var today_file_diff_cost: f64 = 0;
+            var last_ts = entry.last_entry_ts;
             for (entries.items) |e| {
                 const cost = entryCost(e);
+                const old: ?TailEntry = if (e.dedup_hash != 0) tail_map.get(e.dedup_hash) else null;
+                if (old) |o| {
+                    if (o.timestamp_ms >= day_start_ms) {
+                        today_file_diff_cost -= o.cost;
+                    }
+                }
                 if (e.timestamp_ms >= day_start_ms) {
                     today_file_diff_cost += cost;
                 }
+                if (e.timestamp_ms > last_ts) last_ts = e.timestamp_ms;
                 if (cached.scan.block) |existing_block| {
+                    if (old) |o| {
+                        if (o.timestamp_ms >= existing_block.start_ms and o.timestamp_ms <= existing_block.end_ms) {
+                            block_diff_cost -= o.cost;
+                        }
+                    }
                     if (e.timestamp_ms >= existing_block.start_ms and e.timestamp_ms <= existing_block.end_ms) {
                         block_diff_cost += cost;
                     }
@@ -1040,6 +1237,8 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
                 .file_size = ch.file_size,
                 .per_file_cost = entry.per_file_cost + today_file_diff_cost,
                 .parsed_size = ch.file_size,
+                .last_entry_ts = last_ts,
+                .tail = buildTail(allocator, entry.tail, entries.items),
             }) catch continue;
         } else {
             new_files.append(allocator, entry) catch continue;
@@ -1105,10 +1304,12 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
 
         const new_items = all_entries.items[start_idx..];
         var per_cost: f64 = 0;
+        var last_ts: i64 = 0;
         for (new_items) |entry| {
             if (entry.timestamp_ms >= day_start_ms) {
                 per_cost += entryCost(entry);
             }
+            if (entry.timestamp_ms > last_ts) last_ts = entry.timestamp_ms;
         }
         total_today_cost += per_cost;
         cache_files.append(allocator, .{
@@ -1116,6 +1317,8 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
             .file_size = fi.size,
             .per_file_cost = per_cost,
             .parsed_size = fi.size,
+            .last_entry_ts = last_ts,
+            .tail = buildTail(allocator, &.{}, new_items),
         }) catch continue;
     }
 
@@ -1234,6 +1437,73 @@ test "parseJsonlContent per-file dedup still works" {
     try std.testing.expectEqual(@as(usize, 1), entries.items.len);
 }
 
+test "parseJsonlContent same-file duplicate keeps the last usage snapshot" {
+    // Streaming writes several lines per (msg_id, requestId); intermediate
+    // lines carry a placeholder output_tokens and only the final line the
+    // real count, so dedup must keep the last snapshot.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seen = DedupSet.empty;
+
+    const content =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":6}},"requestId":"req_001"}
+        \\{"timestamp":"2025-06-15T10:00:01Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":6}},"requestId":"req_001"}
+        \\{"timestamp":"2025-06-15T10:00:02Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":751}},"requestId":"req_001"}
+    ;
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    parseJsonlContent(alloc, alloc, content, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqual(@as(i64, 751), entries.items[0].usage.output_tokens);
+}
+
+test "parseJsonlContent same-file invalid duplicate does not clobber entry" {
+    // A duplicate line missing usage/timestamp must keep the existing entry.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var seen = DedupSet.empty;
+
+    const content =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}},"requestId":"req_001"}
+        \\{"message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1,"output_tokens":1}},"requestId":"req_001"}
+    ;
+
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    parseJsonlContent(alloc, alloc, content, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqual(@as(i64, 500), entries.items[0].usage.output_tokens);
+}
+
+test "parseJsonlContent cross-file duplicate keeps the first file's entry" {
+    // A duplicate key in a different entries list (copied session file) must
+    // not touch the first list's entry, even with differing usage.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var global_seen = DedupSet.empty;
+
+    const line1 =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}},"requestId":"req_001"}
+    ;
+    const line2 =
+        \\{"timestamp":"2025-06-15T10:00:01Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":999}},"requestId":"req_001"}
+    ;
+
+    var entries1: std.ArrayList(TranscriptEntry) = .empty;
+    parseJsonlContent(alloc, alloc, line1, &entries1, &global_seen);
+    try std.testing.expectEqual(@as(usize, 1), entries1.items.len);
+
+    var entries2: std.ArrayList(TranscriptEntry) = .empty;
+    parseJsonlContent(alloc, alloc, line2, &entries2, &global_seen);
+    try std.testing.expectEqual(@as(usize, 0), entries2.items.len);
+    try std.testing.expectEqual(@as(i64, 500), entries1.items[0].usage.output_tokens);
+}
+
 test "parseJsonlContent no dedup without ids" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1266,8 +1536,12 @@ test "cache roundtrip with block" {
             .burn_rate_per_hr = 1.23,
         },
     };
+    const tail = [_]TailEntry{
+        .{ .hash = 0xDEADBEEF, .timestamp_ms = 1699990000000, .cost = 0.125 },
+        .{ .hash = 0xCAFEBABE, .timestamp_ms = 1699990005000, .cost = 2.5 },
+    };
     const files = [_]CachedFileEntry{
-        .{ .path = "/tmp/test/file1.jsonl", .file_size = 4096, .per_file_cost = 3.21, .parsed_size = 4096 },
+        .{ .path = "/tmp/test/file1.jsonl", .file_size = 4096, .per_file_cost = 3.21, .parsed_size = 4096, .last_entry_ts = 1699990005000, .tail = &tail },
         .{ .path = "/tmp/test/file2.jsonl", .file_size = 8192, .per_file_cost = 9.12, .parsed_size = 8000 },
     };
     const now_s: i64 = 1700000000;
@@ -1279,6 +1553,7 @@ test "cache roundtrip with block" {
     const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered(), day_start_ms) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
+    defer for (result.files) |f| std.testing.allocator.free(f.tail);
 
     try std.testing.expectEqual(now_s, result.write_time_s);
     try std.testing.expectEqual(last_full_scan_s, result.last_full_scan_s);
@@ -1299,6 +1574,16 @@ test "cache roundtrip with block" {
     try std.testing.expectEqualStrings("/tmp/test/file2.jsonl", result.files[1].path);
     try std.testing.expectEqual(@as(i64, 8192), result.files[1].file_size);
     try std.testing.expectEqual(@as(i64, 8000), result.files[1].parsed_size);
+
+    try std.testing.expectEqual(@as(i64, 1699990005000), result.files[0].last_entry_ts);
+    try std.testing.expectEqual(@as(i64, 0), result.files[1].last_entry_ts);
+    try std.testing.expectEqual(@as(usize, 2), result.files[0].tail.len);
+    try std.testing.expectEqual(@as(u64, 0xDEADBEEF), result.files[0].tail[0].hash);
+    try std.testing.expectEqual(@as(i64, 1699990000000), result.files[0].tail[0].timestamp_ms);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.125), result.files[0].tail[0].cost, 1e-10);
+    try std.testing.expectEqual(@as(u64, 0xCAFEBABE), result.files[0].tail[1].hash);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.files[0].tail[1].cost, 1e-10);
+    try std.testing.expectEqual(@as(usize, 0), result.files[1].tail.len);
 }
 
 test "cache roundtrip without block" {
@@ -1814,6 +2099,173 @@ test "diffScan keeps cached null block when no files changed (no false fullScan)
     try std.testing.expectEqual(@as(?BlockInfo, null), result.?.block);
 }
 
+test "diffScan replaces cached streaming placeholder instead of double counting" {
+    // A streaming message's intermediate line can be counted by one scan while
+    // its finalized line is only appended afterwards. The next diff scan must
+    // replace the old contribution instead of adding the finalized line on
+    // top (a double count that would persist until the next fullScan).
+    const projects = "/tmp/cc-test-tail-projects";
+    const proj_dir = projects ++ "/proj";
+    const file_path = proj_dir ++ "/session.jsonl";
+    const cp = "/tmp/cc-test-tail-cache.bin";
+
+    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
+    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
+    defer removeTmpFile(cp);
+
+    const placeholder =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":6}},"requestId":"req_001"}
+    ;
+    const final =
+        \\{"timestamp":"2025-06-15T10:00:05Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":751}},"requestId":"req_001"}
+    ;
+    const final2 =
+        \\{"timestamp":"2025-06-15T10:00:09Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":2000}},"requestId":"req_001"}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+
+    // Scan 1 (full): only the placeholder snapshot exists yet.
+    try createTmpFile(file_path, placeholder ++ "\n");
+    _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+
+    // The finalized line lands after the cache was written.
+    try createTmpFile(file_path, placeholder ++ "\n" ++ final ++ "\n");
+    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
+        return error.TestUnexpectedResult;
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 }, 0);
+    try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
+    // The active block contains both snapshots, so its cost is replaced too.
+    try std.testing.expectApproxEqAbs(expected, result.block.?.cost, 1e-9);
+
+    // A yet-newer snapshot must replace the diff-counted one, not the
+    // original placeholder — the tail is updated by the diff scan too.
+    try createTmpFile(file_path, placeholder ++ "\n" ++ final ++ "\n" ++ final2 ++ "\n");
+    const cached2 = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
+    const result2 = diffScan(alloc, cached2, now_ms, now_s, day_start_ms, null, cp) orelse
+        return error.TestUnexpectedResult;
+    const expected2 = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 }, 0);
+    try std.testing.expectApproxEqAbs(expected2, result2.today_cost, 1e-9);
+}
+
+test "diffScan replaces snapshot even when many messages interleave before finalization" {
+    // The finalized streaming line can land after more than tail_max other
+    // unique messages within one scan. Keep-last overwrites the placeholder's
+    // slot in place, so the tail must select by recency (timestamp), not by
+    // slot position — otherwise the message drops out of the tail and the
+    // next diff scan double-counts its following snapshot.
+    const projects = "/tmp/cc-test-tail-interleave-projects";
+    const proj_dir = projects ++ "/proj";
+    const file_path = proj_dir ++ "/session.jsonl";
+    const cp = "/tmp/cc-test-tail-interleave-cache.bin";
+
+    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
+    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
+    defer removeTmpFile(cp);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var content: std.Io.Writer.Allocating = .init(alloc);
+    // Placeholder snapshot of msg_x, then tail_max + 1 unique fillers, then
+    // the finalized snapshot of msg_x — all within the first scan.
+    try content.writer.writeAll(
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_x","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":6}},"requestId":"req_x"}
+        \\
+    );
+    for (0..tail_max + 1) |i| {
+        try content.writer.print(
+            \\{{"timestamp":"2025-06-15T10:00:{d:0>2}Z","message":{{"id":"msg_a{d}","model":"claude-sonnet-4-5-20250929","usage":{{"input_tokens":1000,"output_tokens":100}}}},"requestId":"req_a{d}"}}
+            \\
+        , .{ i + 1, i, i });
+    }
+    try content.writer.writeAll(
+        \\{"timestamp":"2025-06-15T10:00:30Z","message":{"id":"msg_x","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":751}},"requestId":"req_x"}
+        \\
+    );
+    try createTmpFile(file_path, content.written());
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+
+    // A newer snapshot of msg_x lands after the cache was written.
+    try content.writer.writeAll(
+        \\{"timestamp":"2025-06-15T10:00:35Z","message":{"id":"msg_x","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":2000}},"requestId":"req_x"}
+        \\
+    );
+    try createTmpFile(file_path, content.written());
+
+    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
+        return error.TestUnexpectedResult;
+
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+    const filler = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 100 }, 0);
+    const x_final = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 }, 0);
+    const expected = @as(f64, @floatFromInt(tail_max + 1)) * filler + x_final;
+    try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
+}
+
+test "diffScan falls back to fullScan when appended lines replay old history" {
+    // A session rewind/branch re-appends already-counted messages verbatim,
+    // with their original (old) timestamps — arbitrarily far beyond any
+    // bounded tail. diffScan must detect the timestamp regression and return
+    // null so the caller re-runs fullScan, whose dedup collapses the replay.
+    const projects = "/tmp/cc-test-replay-projects";
+    const proj_dir = projects ++ "/proj";
+    const file_path = proj_dir ++ "/session.jsonl";
+    const cp = "/tmp/cc-test-replay-cache.bin";
+
+    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
+    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
+    defer removeTmpFile(cp);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const m1 =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":500}},"requestId":"req_001"}
+    ;
+    const m2 =
+        \\{"timestamp":"2025-06-15T10:05:00Z","message":{"id":"msg_002","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":2000,"output_tokens":300}},"requestId":"req_002"}
+    ;
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+
+    try createTmpFile(file_path, m1 ++ "\n" ++ m2 ++ "\n");
+    _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+
+    // Replay of m1 appended verbatim: its timestamp regresses 5 minutes below
+    // the file's last counted entry.
+    try createTmpFile(file_path, m1 ++ "\n" ++ m2 ++ "\n" ++ m1 ++ "\n");
+    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        @as(?ScanResult, null),
+        diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp),
+    );
+
+    // The fullScan fallback collapses the replayed line via dedup.
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 500 }, 0) +
+        pricing.calculateEntryCost(p, .{ .input_tokens = 2000, .output_tokens = 300 }, 0);
+    const rescanned = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+    try std.testing.expectApproxEqAbs(expected, rescanned.today_cost, 1e-9);
+}
+
 // --- parseJsonlContent fast mode ---
 
 test "parseJsonlContent parses speed fast" {
@@ -2052,8 +2504,9 @@ test "cache partial file entries truncated" {
     try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms);
 
     const full_data = aw.writer.buffered();
-    // Truncate after first file entry + partial second entry
-    const truncated_len = cache_header_size + 2 + "/tmp/f1.jsonl".len + 24 + 5;
+    // Truncate after first file entry (2 path_len + path + 32 fixed fields +
+    // 2 tail_len with empty tail) + partial second entry
+    const truncated_len = cache_header_size + 2 + "/tmp/f1.jsonl".len + 32 + 2 + 5;
     const result = parseCacheBytes(std.testing.allocator, full_data[0..truncated_len], day_start_ms) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
