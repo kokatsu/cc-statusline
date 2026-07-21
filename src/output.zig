@@ -64,6 +64,22 @@ pub const Theme = struct {
     /// Render the session name segment on line 1. `initTheme` enables it only
     /// when `CC_STATUSLINE_SHOW_SESSION=1`.
     show_session: bool = true,
+    /// Effort-level colors, mirroring Claude Code's `/effort` slider theme
+    /// keys (low=warning, medium=success, high=permission, xhigh=autoAccept).
+    /// Defaults are the built-in dark theme's values; unknown levels fall
+    /// back to `dim`.
+    effort_low: []const u8 = "\x1b[38;2;255;193;7m", // warning (#FFC107)
+    effort_medium: []const u8 = "\x1b[38;2;78;186;101m", // success (#4EBA65)
+    effort_high: []const u8 = "\x1b[38;2;177;185;249m", // permission (#B1B9F9)
+    effort_xhigh: []const u8 = "\x1b[38;2;175;135;255m", // autoAccept (#AF87FF)
+    /// "max" renders as a static rainbow: one color per glyph of "⚡max"
+    /// (rainbow_red/yellow/green/blue).
+    effort_max: [4][]const u8 = .{
+        "\x1b[38;2;235;95;87m", // rainbow_red (#EB5F57)
+        "\x1b[38;2;250;195;95m", // rainbow_yellow (#FAC35F)
+        "\x1b[38;2;145;200;130m", // rainbow_green (#91C882)
+        "\x1b[38;2;130;170;220m", // rainbow_blue (#82AADC)
+    },
 };
 
 pub const theme_default = Theme{
@@ -82,6 +98,16 @@ pub const theme_catppuccin_mocha = Theme{
     .yellow = "\x1b[38;2;249;226;175m", // Yellow (#f9e2af)
     .red = "\x1b[38;2;243;139;168m", // Red (#f38ba8)
     .dim = "\x1b[38;2;108;112;134m", // Overlay0 (#6c7086)
+    .effort_low = "\x1b[38;2;249;226;175m", // Yellow (#f9e2af)
+    .effort_medium = "\x1b[38;2;166;227;161m", // Green (#a6e3a1)
+    .effort_high = "\x1b[38;2;180;190;254m", // Lavender (#b4befe)
+    .effort_xhigh = "\x1b[38;2;203;166;247m", // Mauve (#cba6f7)
+    .effort_max = .{
+        "\x1b[38;2;243;139;168m", // Red (#f38ba8)
+        "\x1b[38;2;249;226;175m", // Yellow (#f9e2af)
+        "\x1b[38;2;166;227;161m", // Green (#a6e3a1)
+        "\x1b[38;2;137;180;250m", // Blue (#89b4fa)
+    },
 };
 
 pub const theme_catppuccin_latte = Theme{
@@ -91,6 +117,16 @@ pub const theme_catppuccin_latte = Theme{
     .yellow = "\x1b[38;2;223;142;29m",
     .red = "\x1b[38;2;210;15;57m",
     .dim = "\x1b[38;2;156;160;176m",
+    .effort_low = "\x1b[38;2;223;142;29m", // Yellow (#df8e1d)
+    .effort_medium = "\x1b[38;2;64;160;43m", // Green (#40a02b)
+    .effort_high = "\x1b[38;2;114;135;253m", // Lavender (#7287fd)
+    .effort_xhigh = "\x1b[38;2;136;57;239m", // Mauve (#8839ef)
+    .effort_max = .{
+        "\x1b[38;2;210;15;57m", // Red (#d20f39)
+        "\x1b[38;2;223;142;29m", // Yellow (#df8e1d)
+        "\x1b[38;2;64;160;43m", // Green (#40a02b)
+        "\x1b[38;2;30;102;245m", // Blue (#1e66f5)
+    },
 };
 
 pub const theme_catppuccin_frappe = Theme{
@@ -100,6 +136,16 @@ pub const theme_catppuccin_frappe = Theme{
     .yellow = "\x1b[38;2;229;200;144m",
     .red = "\x1b[38;2;231;130;132m",
     .dim = "\x1b[38;2;115;121;148m",
+    .effort_low = "\x1b[38;2;229;200;144m", // Yellow (#e5c890)
+    .effort_medium = "\x1b[38;2;166;209;137m", // Green (#a6d189)
+    .effort_high = "\x1b[38;2;186;187;241m", // Lavender (#babbf1)
+    .effort_xhigh = "\x1b[38;2;202;158;230m", // Mauve (#ca9ee6)
+    .effort_max = .{
+        "\x1b[38;2;231;130;132m", // Red (#e78284)
+        "\x1b[38;2;229;200;144m", // Yellow (#e5c890)
+        "\x1b[38;2;166;209;137m", // Green (#a6d189)
+        "\x1b[38;2;140;170;238m", // Blue (#8caaee)
+    },
 };
 
 pub const theme_catppuccin_macchiato = Theme{
@@ -109,21 +155,16 @@ pub const theme_catppuccin_macchiato = Theme{
     .yellow = "\x1b[38;2;238;212;159m",
     .red = "\x1b[38;2;237;135;150m",
     .dim = "\x1b[38;2;110;115;141m",
-};
-
-// Effort-level colors: Claude Code's own rainbow palette (`rainbow_*` theme
-// colors), so the indicator matches the official UI in every theme. Unknown
-// levels fall back to `theme.dim`.
-const effort_low_color = "\x1b[38;2;250;195;95m"; // rainbow_yellow (#FAC35F)
-const effort_medium_color = "\x1b[38;2;145;200;130m"; // rainbow_green (#91C882)
-const effort_high_color = "\x1b[38;2;130;170;220m"; // rainbow_blue (#82AADC)
-const effort_xhigh_color = "\x1b[38;2;200;130;180m"; // rainbow_violet (#C882B4)
-/// "max" renders as a static rainbow: one color per glyph of "⚡max".
-const effort_max_colors = [4][]const u8{
-    "\x1b[38;2;235;95;87m", // rainbow_red (#EB5F57)
-    "\x1b[38;2;250;195;95m", // rainbow_yellow (#FAC35F)
-    "\x1b[38;2;145;200;130m", // rainbow_green (#91C882)
-    "\x1b[38;2;130;170;220m", // rainbow_blue (#82AADC)
+    .effort_low = "\x1b[38;2;238;212;159m", // Yellow (#eed49f)
+    .effort_medium = "\x1b[38;2;166;218;149m", // Green (#a6da95)
+    .effort_high = "\x1b[38;2;183;189;248m", // Lavender (#b7bdf8)
+    .effort_xhigh = "\x1b[38;2;198;160;246m", // Mauve (#c6a0f6)
+    .effort_max = .{
+        "\x1b[38;2;237;135;150m", // Red (#ed8796)
+        "\x1b[38;2;238;212;159m", // Yellow (#eed49f)
+        "\x1b[38;2;166;218;149m", // Green (#a6da95)
+        "\x1b[38;2;138;173;244m", // Blue (#8aadf4)
+    },
 };
 
 pub const ThemeOverrides = struct {
@@ -624,10 +665,10 @@ fn displayWidth(s: []const u8) usize {
 }
 
 fn effortColor(theme: Theme, level: []const u8) []const u8 {
-    if (mem.eql(u8, level, "low")) return effort_low_color;
-    if (mem.eql(u8, level, "medium")) return effort_medium_color;
-    if (mem.eql(u8, level, "high")) return effort_high_color;
-    if (mem.eql(u8, level, "xhigh")) return effort_xhigh_color;
+    if (mem.eql(u8, level, "low")) return theme.effort_low;
+    if (mem.eql(u8, level, "medium")) return theme.effort_medium;
+    if (mem.eql(u8, level, "high")) return theme.effort_high;
+    if (mem.eql(u8, level, "xhigh")) return theme.effort_xhigh;
     return theme.dim;
 }
 
@@ -640,7 +681,7 @@ fn writeLine1(w: *Writer, theme: Theme, stdin_info: StdinInfo, git_branch: ?[]co
         if (stdin_info.effort_level) |level| {
             // ⚡ U+26A1
             if (mem.eql(u8, level, "max")) {
-                const c = effort_max_colors;
+                const c = theme.effort_max;
                 try w.print(" {s}\xe2\x9a\xa1{s}m{s}a{s}x{s}", .{ c[0], c[1], c[2], c[3], theme.reset });
             } else {
                 try w.print(" {s}\xe2\x9a\xa1{s}{s}", .{ effortColor(theme, level), level, theme.reset });
@@ -1109,21 +1150,24 @@ test "printOutput line1 no agent name does not emit puzzle emoji" {
 }
 
 test "printOutput line1 effort level colored per level" {
-    const cases = [_]struct { level: []const u8, color: []const u8 }{
-        .{ .level = "low", .color = effort_low_color },
-        .{ .level = "medium", .color = effort_medium_color },
-        .{ .level = "high", .color = effort_high_color },
-        .{ .level = "xhigh", .color = effort_xhigh_color },
-    };
-    for (cases) |case| {
-        var aw: Writer.Allocating = .init(std.testing.allocator);
-        defer aw.deinit();
-        const info = StdinInfo{ .model_name = "Fable", .effort_level = case.level };
-        try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
-        var expected_buf: [64]u8 = undefined;
-        // ⚡ U+26A1
-        const expected = try std.fmt.bufPrint(&expected_buf, "{s}\xe2\x9a\xa1{s}", .{ case.color, case.level });
-        try std.testing.expect(contains(aw.writer.buffered(), expected));
+    const themes = [_]Theme{ theme_default, theme_catppuccin_mocha };
+    for (themes) |theme| {
+        const cases = [_]struct { level: []const u8, color: []const u8 }{
+            .{ .level = "low", .color = theme.effort_low },
+            .{ .level = "medium", .color = theme.effort_medium },
+            .{ .level = "high", .color = theme.effort_high },
+            .{ .level = "xhigh", .color = theme.effort_xhigh },
+        };
+        for (cases) |case| {
+            var aw: Writer.Allocating = .init(std.testing.allocator);
+            defer aw.deinit();
+            const info = StdinInfo{ .model_name = "Fable", .effort_level = case.level };
+            try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+            var expected_buf: [64]u8 = undefined;
+            // ⚡ U+26A1
+            const expected = try std.fmt.bufPrint(&expected_buf, "{s}\xe2\x9a\xa1{s}", .{ case.color, case.level });
+            try std.testing.expect(contains(aw.writer.buffered(), expected));
+        }
     }
 }
 
@@ -1132,8 +1176,8 @@ test "printOutput line1 effort max rainbow per glyph" {
     defer aw.deinit();
     const info = StdinInfo{ .model_name = "Fable", .effort_level = "max" };
     try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
-    const expected = effort_max_colors[0] ++ "\xe2\x9a\xa1" ++ effort_max_colors[1] ++ "m" ++
-        effort_max_colors[2] ++ "a" ++ effort_max_colors[3] ++ "x"; // ⚡max
+    const c = theme_default.effort_max;
+    const expected = c[0] ++ "\xe2\x9a\xa1" ++ c[1] ++ "m" ++ c[2] ++ "a" ++ c[3] ++ "x"; // ⚡max
     try std.testing.expect(contains(aw.writer.buffered(), expected));
 }
 

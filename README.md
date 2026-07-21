@@ -6,7 +6,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 
 ## Features
 
-- **Model & Context** — Current model name, reasoning effort level (⚡, tinted per level with Claude Code's rainbow palette; `max` gets a rainbow gradient), git branch, context window usage with color-coded progress bar (green → yellow → red) and token counts (`126k/200k`)
+- **Model & Context** — Current model name, reasoning effort level (⚡, tinted per level like Claude Code's `/effort` slider — theme-aware, with a rainbow gradient for `max`), git branch, context window usage with color-coded progress bar (green → yellow → red) and token counts (`126k/200k`)
 - **Session Name** — Shows custom session name (📛) set via `--name` or `/rename` (opt-in via `CC_STATUSLINE_SHOW_SESSION=1`)
 - **Subagent Indicator** — Shows current subagent name (🧩) when running inside a Claude Code subagent
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
