@@ -6,7 +6,8 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 
 ## Features
 
-- **Model & Context** — Current model name, git branch, context window usage with color-coded progress bar (green → yellow → red)
+- **Model & Context** — Current model name, reasoning effort level (⚡), git branch, context window usage with color-coded progress bar (green → yellow → red) and token counts (`126k/200k`)
+- **Session Name** — Shows custom session name (📛) set via `--name` or `/rename`
 - **Subagent Indicator** — Shows current subagent name (🧩) when running inside a Claude Code subagent
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour
@@ -32,7 +33,7 @@ The binary is output to `zig-out/bin/cc-statusline`.
 cc-statusline reads Claude Code's statusline JSON from stdin and outputs ANSI-colored status (2-3 lines depending on available data):
 
 ```text
-🤖 Opus 4.8 (1M context) | 🌿 main | 🧠 ██████▓░░░ 63%
+🤖 Fable ⚡xhigh | 📛 my-session | 🌿 main | 🧠 ██████▓░░░ 63% 126k/200k
 💰 $26.79 today | 📊 $5.27 block 🔥 $11.33 /h
 🕔 5h ████▓░░░░░ 42% 1h 30m 05/08 01:00 | 📅 7d ░░░░░░░░░░ 4% 4d 11h 05/12 08:00
 ```

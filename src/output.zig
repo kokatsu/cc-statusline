@@ -58,6 +58,9 @@ pub const Theme = struct {
     bar_width: u8 = default_bar_width,
     /// How much rate-limit reset info to render (also sized from `COLUMNS`).
     reset_info: ResetInfo = .full,
+    /// Terminal width from `COLUMNS`; `planLine1` fits line 1 into it.
+    /// `null` (absent or unparseable) leaves line 1 unconstrained.
+    cols: ?u16 = null,
 };
 
 pub const theme_default = Theme{
@@ -142,6 +145,8 @@ pub fn buildTheme(theme_name: ?[]const u8, overrides: ThemeOverrides) Theme {
 }
 
 /// Bar width plus how much reset info to render, derived together from `COLUMNS`.
+/// Line 1 has uncontrolled-width parts (model and agent names), so it is not
+/// budgeted here; `planLine1` measures the actual rendered width instead.
 pub const Layout = struct {
     bar_width: u8,
     reset_info: ResetInfo,
@@ -149,10 +154,11 @@ pub const Layout = struct {
 
 /// Map a terminal column count to a rate-limit-line layout via fixed breakpoints.
 ///
-/// The 5h/7d rate-limit line is the widest layout we render. Each window is
-/// `label(2) + bar(W) + "100%"(4) + duration(max `max_reset_duration_cols`=7,
-/// e.g. "23h 59m") + "MM/DD HH:MM"(11)` with single-space gaps; there are two
-/// of them plus the leading 🕔/📅 emoji and the " | " divider. Worst-case widths:
+/// The 5h/7d rate-limit line is the widest fully-controlled line we render.
+/// Each window is `label(2) + bar(W) + "100%"(4) + duration(max
+/// `max_reset_duration_cols`=7, e.g. "23h 59m") + "MM/DD HH:MM"(11)` with
+/// single-space gaps; there are two of them plus the leading 🕔/📅 emoji and
+/// the " | " divider. Worst-case widths:
 ///
 ///     bar present:   65 + 2 * bar_width   (line = 69..85 for W ∈ {2..10})
 ///     bar hidden:    63                   (drops `bar+sp` per window → -2)
@@ -173,12 +179,18 @@ pub fn layoutForColumns(cols: u16) Layout {
     return .{ .bar_width = 0, .reset_info = .none }; // 23
 }
 
-/// Parse the `COLUMNS` value into a `Layout`. Absent or unparseable (older
-/// Claude Code, or a non-terminal pipe) falls back to the full layout.
+/// Parse the `COLUMNS` value. Absent or unparseable (older Claude Code, or a
+/// non-terminal pipe) yields null.
+fn parseColumns(val: ?[]const u8) ?u16 {
+    const s = val orelse return null;
+    return std.fmt.parseInt(u16, s, 10) catch null;
+}
+
+/// Map the `COLUMNS` value to a `Layout`, falling back to the full layout
+/// when unparseable.
 fn parseLayout(val: ?[]const u8) Layout {
-    const default: Layout = .{ .bar_width = default_bar_width, .reset_info = .full };
-    const s = val orelse return default;
-    const cols = std.fmt.parseInt(u16, s, 10) catch return default;
+    const cols = parseColumns(val) orelse
+        return .{ .bar_width = default_bar_width, .reset_info = .full };
     return layoutForColumns(cols);
 }
 
@@ -201,6 +213,7 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
     const layout = parseLayout(env.get("COLUMNS"));
     theme.bar_width = layout.bar_width;
     theme.reset_info = layout.reset_info;
+    theme.cols = parseColumns(env.get("COLUMNS"));
     return theme;
 }
 
@@ -216,6 +229,20 @@ pub fn formatCurrency(buf: []u8, value: f64) []const u8 {
         return std.fmt.bufPrint(buf, "${d:.4}", .{value}) catch "$?.??";
     }
     return std.fmt.bufPrint(buf, "${d:.2}", .{value}) catch "$?.??";
+}
+
+pub fn formatTokens(buf: []u8, tokens: i64) []const u8 {
+    if (tokens < 1000) {
+        return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "?";
+    }
+    if (tokens < 1_000_000) {
+        return std.fmt.bufPrint(buf, "{d}k", .{@divFloor(tokens, 1000)}) catch "?";
+    }
+    if (@rem(tokens, 1_000_000) == 0) {
+        return std.fmt.bufPrint(buf, "{d}M", .{@divFloor(tokens, 1_000_000)}) catch "?";
+    }
+    const millions = @as(f64, @floatFromInt(tokens)) / 1_000_000.0;
+    return std.fmt.bufPrint(buf, "{d:.1}M", .{millions}) catch "?";
 }
 
 fn thresholdColor(theme: Theme, value: f64, yellow: f64, red: f64) []const u8 {
@@ -288,6 +315,70 @@ pub fn formatResetDuration(buf: []u8, remaining_ms: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}m", .{mins}) catch "??";
 }
 
+const LastCodepoint = struct { cp: u21, start: usize };
+
+/// Decode the last codepoint of `s`, or null when `s` is empty or ends in a
+/// malformed sequence.
+fn lastCodepoint(s: []const u8) ?LastCodepoint {
+    if (s.len == 0) return null;
+    var start = s.len - 1;
+    while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
+    const len = std.unicode.utf8ByteSequenceLength(s[start]) catch return null;
+    if (start + len != s.len) return null;
+    const cp = std.unicode.utf8Decode(s[start..]) catch return null;
+    return .{ .cp = cp, .start = start };
+}
+
+/// Decode the codepoint starting at byte offset `i`, or null when out of
+/// bounds or malformed.
+fn codepointAt(s: []const u8, i: usize) ?u21 {
+    if (i >= s.len) return null;
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return null;
+    if (i + len > s.len) return null;
+    return std.unicode.utf8Decode(s[i..][0..len]) catch null;
+}
+
+fn isRegionalIndicator(cp: u21) bool {
+    return cp >= 0x1F1E6 and cp <= 0x1F1FF;
+}
+
+fn trailingRegionalIndicatorRun(s: []const u8) usize {
+    var count: usize = 0;
+    var end = s.len;
+    while (lastCodepoint(s[0..end])) |last| {
+        if (!isRegionalIndicator(last.cp)) break;
+        count += 1;
+        end = last.start;
+    }
+    return count;
+}
+
+/// Walk `cut` back to the nearest grapheme-safe boundary of `s`, so the kept
+/// prefix never ends mid-cluster. The codepoint after the cut decides: a
+/// zero-width mark or skin-tone modifier there means the cluster continues
+/// past the cut, and a regional indicator after an odd trailing run of them
+/// is half a flag. A trailing ZWJ always dangles. Complete trailing
+/// sequences (é, ☀️, 1️⃣) are kept intact — this approximates UAX #29 with
+/// only the cluster kinds that occur in names.
+fn stripTornFragments(s: []const u8, cut: usize) usize {
+    var end = cut;
+    while (end > 0) {
+        const last = lastCodepoint(s[0..end]) orelse break;
+        if (last.cp == 0x200D) { // dangling ZWJ
+            end = last.start;
+            continue;
+        }
+        const next = codepointAt(s, end) orelse break;
+        const cluster_continues = isZeroWidth(next) or
+            (next >= 0x1F3FB and next <= 0x1F3FF) or // skin-tone modifier
+            (isRegionalIndicator(next) and isRegionalIndicator(last.cp) and
+                trailingRegionalIndicatorRun(s[0..end]) % 2 == 1);
+        if (!cluster_continues) break;
+        end = last.start;
+    }
+    return end;
+}
+
 pub fn truncateBranch(buf: *[256]u8, branch: []const u8, max_len: usize) []const u8 {
     if (max_len < 4 or branch.len <= max_len) return branch;
     var cut = max_len - 1;
@@ -295,6 +386,7 @@ pub fn truncateBranch(buf: *[256]u8, branch: []const u8, max_len: usize) []const
     while (cut > 0 and (branch[cut] & 0xC0) == 0x80) {
         cut -= 1;
     }
+    cut = stripTornFragments(branch, cut);
     @memcpy(buf[0..cut], branch[0..cut]);
     @memcpy(buf[cut..][0..3], "\xe2\x80\xa6"); // U+2026 …
     return buf[0 .. cut + 3];
@@ -343,10 +435,176 @@ fn writeRateLimitWindow(w: *Writer, theme: Theme, label: []const u8, rl: RateLim
     }
 }
 
-pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanResult, now_ms: i64, utc_offset_s: i32, git_branch: ?[]const u8) !void {
-    // === Line 1: Model + Agent + Branch + Context ===
+/// Line-1 rendering decisions produced by `planLine1`. Fields start at their
+/// richest setting and are degraded until the rendered line fits `COLUMNS`.
+const Line1Plan = struct {
+    bar_width: u8,
+    name_cap: usize,
+    show_tokens: bool = true,
+    show_effort: bool = true,
+    show_branch: bool = true,
+    show_session: bool = true,
+};
+
+/// Scratch size for measuring line 1: two names at `branch_max_upper` plus
+/// model/agent strings, fixed segments, and ANSI color codes.
+const line1_scratch_size: usize = 2048;
+
+/// East Asian Wide/Fullwidth ranges in the BMP, inclusive, sorted. Derived
+/// from Unicode EastAsianWidth.txt (W/F): the CJK blocks plus the BMP emoji
+/// with default emoji presentation (⌚⏰⭐✅ …). Unassigned gaps inside the
+/// consolidated CJK ranges are counted wide, which errs toward truncating
+/// early rather than wrapping. Codepoints at U+1F000 and above are handled
+/// directly in `isDoubleWidth`.
+const wide_bmp_ranges = [_][2]u21{
+    .{ 0x1100, 0x115F }, // Hangul Jamo
+    .{ 0x231A, 0x231B }, // ⌚⌛
+    .{ 0x2329, 0x232A }, // 〈〉
+    .{ 0x23E9, 0x23EC }, // ⏩⏪⏫⏬
+    .{ 0x23F0, 0x23F0 }, // ⏰
+    .{ 0x23F3, 0x23F3 }, // ⏳
+    .{ 0x25FD, 0x25FE }, // ◽◾
+    .{ 0x2614, 0x2615 }, // ☔☕
+    .{ 0x2648, 0x2653 }, // ♈..♓
+    .{ 0x267F, 0x267F }, // ♿
+    .{ 0x2693, 0x2693 }, // ⚓
+    .{ 0x26A1, 0x26A1 }, // ⚡
+    .{ 0x26AA, 0x26AB }, // ⚪⚫
+    .{ 0x26BD, 0x26BE }, // ⚽⚾
+    .{ 0x26C4, 0x26C5 }, // ⛄⛅
+    .{ 0x26CE, 0x26CE }, // ⛎
+    .{ 0x26D4, 0x26D4 }, // ⛔
+    .{ 0x26EA, 0x26EA }, // ⛪
+    .{ 0x26F2, 0x26F3 }, // ⛲⛳
+    .{ 0x26F5, 0x26F5 }, // ⛵
+    .{ 0x26FA, 0x26FA }, // ⛺
+    .{ 0x26FD, 0x26FD }, // ⛽
+    .{ 0x2705, 0x2705 }, // ✅
+    .{ 0x270A, 0x270B }, // ✊✋
+    .{ 0x2728, 0x2728 }, // ✨
+    .{ 0x274C, 0x274C }, // ❌
+    .{ 0x274E, 0x274E }, // ❎
+    .{ 0x2753, 0x2755 }, // ❓❔❕
+    .{ 0x2757, 0x2757 }, // ❗
+    .{ 0x2795, 0x2797 }, // ➕➖➗
+    .{ 0x27B0, 0x27B0 }, // ➰
+    .{ 0x27BF, 0x27BF }, // ➿
+    .{ 0x2B1B, 0x2B1C }, // ⬛⬜
+    .{ 0x2B50, 0x2B50 }, // ⭐
+    .{ 0x2B55, 0x2B55 }, // ⭕
+    .{ 0x2E80, 0x303E }, // CJK radicals .. CJK symbols/punctuation
+    .{ 0x3041, 0xA4CF }, // kana, CJK unified, Yi (U+303F is narrow)
+    .{ 0xA960, 0xA97F }, // Hangul Jamo Extended-A
+    .{ 0xAC00, 0xD7A3 }, // Hangul syllables
+    .{ 0xF900, 0xFAFF }, // CJK compatibility ideographs
+    .{ 0xFE10, 0xFE19 }, // vertical forms
+    .{ 0xFE30, 0xFE6F }, // CJK compatibility forms
+    .{ 0xFF00, 0xFF60 }, // fullwidth forms
+    .{ 0xFFE0, 0xFFE6 }, // fullwidth signs
+};
+
+/// Zero-width codepoints (wcwidth 0): joiners, variation selectors, and the
+/// common combining-mark blocks, inclusive, sorted. Charged no columns so
+/// sequences like 👩‍💻 (emoji + ZWJ + emoji) or a decomposed é are not
+/// over-counted past their legacy-terminal rendering. Grapheme clustering
+/// itself is intentionally not modeled: terminals disagree on it, and
+/// assuming it would under-count on non-clustering terminals (e.g.
+/// Terminal.app) and reintroduce wrapping. Rare combining blocks (Hebrew,
+/// Arabic, Indic) are omitted; counting those as 1 errs toward truncating
+/// early rather than wrapping.
+const zero_width_ranges = [_][2]u21{
+    .{ 0x0300, 0x036F }, // combining diacritical marks
+    .{ 0x1160, 0x11FF }, // Hangul jungseong/jongseong (conjoining)
+    .{ 0x1AB0, 0x1AFF }, // combining diacritical marks extended
+    .{ 0x1DC0, 0x1DFF }, // combining diacritical marks supplement
+    .{ 0x200B, 0x200F }, // ZWSP, ZWNJ, ZWJ, LRM, RLM
+    .{ 0x2060, 0x2064 }, // word joiner, invisible operators
+    .{ 0x20D0, 0x20FF }, // combining marks for symbols
+    .{ 0xFE00, 0xFE0F }, // variation selectors
+    .{ 0xFE20, 0xFE2F }, // combining half marks
+    .{ 0xFEFF, 0xFEFF }, // zero-width no-break space
+    .{ 0xE0000, 0xE01EF }, // tags and variation selectors supplement
+};
+
+fn isZeroWidth(cp: u21) bool {
+    for (zero_width_ranges) |range| {
+        if (cp < range[0]) return false; // sorted: no later range can match
+        if (cp <= range[1]) return true;
+    }
+    return false;
+}
+
+/// True for codepoints rendered at two terminal columns: the BMP ranges in
+/// `wide_bmp_ranges`, the U+16FE0–U+1B2FB supplementary CJK-script band
+/// (Tangut, Khitan, kana supplements/extensions, Nushu), and everything from
+/// U+1F000 up (emoji and the supplementary CJK ideograph planes).
+fn isDoubleWidth(cp: u21) bool {
+    if (cp >= 0x1F000) return true;
+    if (cp >= 0x16FE0) return cp <= 0x1B2FB;
+    for (wide_bmp_ranges) |range| {
+        if (cp < range[0]) return false; // sorted: no later range can match
+        if (cp <= range[1]) return true;
+    }
+    return false;
+}
+
+/// Terminal column width of one codepoint: 0 for joiners and combining
+/// marks, 2 for East Asian wide and emoji, else 1. The zero check must run
+/// first: U+E0000–U+E01EF (tags, variation selectors supplement) sits above
+/// `isDoubleWidth`'s U+1F000 catch-all threshold.
+fn charWidth(cp: u21) usize {
+    if (isZeroWidth(cp)) return 0;
+    if (isDoubleWidth(cp)) return 2;
+    return 1;
+}
+
+/// Terminal display width: strips ANSI CSI escapes and sums `charWidth`
+/// over the remaining codepoints, with one sequence rule: VS16 (U+FE0F,
+/// emoji presentation) and U+20E3 (enclosing keycap) upgrade a narrow base
+/// to 2 columns — ☀️ and 1️⃣ render as 2-column emoji even though their
+/// bases are EAW-narrow. VS15 (U+FE0E, text presentation) stays zero.
+fn displayWidth(s: []const u8) usize {
+    var width: usize = 0;
+    var last_base_width: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
+            i += 2;
+            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7e)) i += 1; // params
+            if (i < s.len) i += 1; // final byte
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const cp = std.unicode.utf8Decode(s[i..][0..len]) catch {
+            i += 1;
+            continue;
+        };
+        if (cp == 0xFE0F or cp == 0x20E3) {
+            if (last_base_width == 1) {
+                width += 1;
+                last_base_width = 2;
+            }
+        } else {
+            const w = charWidth(cp);
+            width += w;
+            if (w > 0) last_base_width = w; // zero-width marks keep the base
+        }
+        i += len;
+    }
+    return width;
+}
+
+fn writeLine1(w: *Writer, theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8, plan: Line1Plan) !void {
     const model_name = stdin_info.model_name orelse "Unknown";
     try w.print("\xf0\x9f\xa4\x96 {s}{s}{s}", .{ theme.model, model_name, theme.reset });
+
+    // Reasoning effort level
+    if (plan.show_effort) {
+        if (stdin_info.effort_level) |level| {
+            // ⚡ U+26A1
+            try w.print(" {s}\xe2\x9a\xa1{s}{s}", .{ theme.dim, level, theme.reset });
+        }
+    }
 
     // Subagent indicator
     if (stdin_info.agent_name) |name| {
@@ -354,22 +612,48 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
         try w.print(" {s}|{s} \xf0\x9f\xa7\xa9 {s}{s}{s}", .{ theme.dim, theme.reset, theme.agent, name, theme.reset });
     }
 
+    // Session name
+    if (plan.show_session) {
+        if (stdin_info.session_name) |name| {
+            var sess_buf: [256]u8 = undefined;
+            const display_name = truncateBranch(&sess_buf, name, plan.name_cap);
+            // 📛 U+1F4DB
+            try w.print(" {s}|{s} \xf0\x9f\x93\x9b {s}{s}{s}", .{ theme.dim, theme.reset, theme.model, display_name, theme.reset });
+        }
+    }
+
     // Git branch
-    if (git_branch) |branch| {
-        var trunc_buf: [256]u8 = undefined;
-        const display_branch = truncateBranch(&trunc_buf, branch, theme.branch_max);
-        try w.print(" {s}|{s} \xf0\x9f\x8c\xbf {s}{s}{s}", .{ theme.dim, theme.reset, theme.green, display_branch, theme.reset });
+    if (plan.show_branch) {
+        if (git_branch) |branch| {
+            var trunc_buf: [256]u8 = undefined;
+            const display_branch = truncateBranch(&trunc_buf, branch, plan.name_cap);
+            try w.print(" {s}|{s} \xf0\x9f\x8c\xbf {s}{s}{s}", .{ theme.dim, theme.reset, theme.green, display_branch, theme.reset });
+        }
     }
 
     // Context
     if (stdin_info.context_pct) |pct| {
         const color = contextColor(theme, pct);
-        if (theme.bar_width > 0) {
+        if (plan.bar_width > 0) {
             var bar_buf: [progress_bar_buf_size]u8 = undefined;
-            const bar = buildProgressBar(&bar_buf, pct, theme.bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
+            const bar = buildProgressBar(&bar_buf, pct, plan.bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
             try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 {s}{s}{s} {s}{d:.0}%{s}", .{ theme.dim, theme.reset, color, bar, theme.reset, color, pct, theme.reset });
         } else {
             try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 {s}{d:.0}%{s}", .{ theme.dim, theme.reset, color, pct, theme.reset });
+        }
+        if (plan.show_tokens) {
+            if (stdin_info.context_tokens) |tokens| {
+                if (stdin_info.context_window_size) |size| {
+                    var used_buf: [16]u8 = undefined;
+                    var size_buf: [16]u8 = undefined;
+                    try w.print(" {s}{s}/{s}{s}", .{
+                        theme.dim,
+                        formatTokens(&used_buf, tokens),
+                        formatTokens(&size_buf, size),
+                        theme.reset,
+                    });
+                }
+            }
         }
     } else {
         try w.print(" {s}|{s} \xf0\x9f\xa7\xa0 N/A", .{ theme.dim, theme.reset });
@@ -379,7 +663,66 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
     if (stdin_info.exceeds_200k_tokens) {
         try w.writeAll(" \xf0\x9f\x9a\xa8"); // 🚨 U+1F6A8
     }
+}
 
+fn line1Fits(theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8, plan: Line1Plan, cols: u16) bool {
+    var buf: [line1_scratch_size]u8 = undefined;
+    var fw: Writer = .fixed(&buf);
+    writeLine1(&fw, theme, stdin_info, git_branch, plan) catch return false;
+    return displayWidth(fw.buffered()) <= cols;
+}
+
+/// Largest name cap in `[floor, base.name_cap]` whose rendering fits, or
+/// `floor` when none does. Width is monotone in the cap, so binary search.
+fn largestFittingCap(theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8, base: Line1Plan, cols: u16, floor: usize) usize {
+    if (base.name_cap <= floor) return base.name_cap;
+    var plan = base;
+    plan.name_cap = floor;
+    if (!line1Fits(theme, stdin_info, git_branch, plan, cols)) return floor;
+    var lo = floor;
+    var hi = base.name_cap;
+    while (lo < hi) {
+        const mid = lo + (hi - lo + 1) / 2;
+        plan.name_cap = mid;
+        if (line1Fits(theme, stdin_info, git_branch, plan, cols)) lo = mid else hi = mid - 1;
+    }
+    return lo;
+}
+
+/// Fit line 1 into `theme.cols` by measuring the actual rendered width —
+/// model and agent names are uncontrolled, so no static budget can cover
+/// them. Degradation order: shrink session/branch toward 12 columns, drop
+/// token counts, shrink toward 8, hide the bar, shrink toward 4, then omit
+/// effort, branch, and session. When even that exceeds the terminal (a very
+/// long model or agent name on a very narrow terminal) the minimal plan is
+/// rendered as-is.
+fn planLine1(theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8) Line1Plan {
+    var plan = Line1Plan{ .bar_width = theme.bar_width, .name_cap = theme.branch_max };
+    const cols = theme.cols orelse return plan;
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+
+    plan.name_cap = largestFittingCap(theme, stdin_info, git_branch, plan, cols, 12);
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.show_tokens = false;
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.name_cap = largestFittingCap(theme, stdin_info, git_branch, plan, cols, 8);
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.bar_width = 0;
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.name_cap = largestFittingCap(theme, stdin_info, git_branch, plan, cols, 4);
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.show_effort = false;
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.show_branch = false;
+    if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
+    plan.show_session = false;
+    return plan;
+}
+
+pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanResult, now_ms: i64, utc_offset_s: i32, git_branch: ?[]const u8) !void {
+    // === Line 1: Model + Effort + Agent + Session + Branch + Context ===
+    const plan = planLine1(theme, stdin_info, git_branch);
+    try writeLine1(w, theme, stdin_info, git_branch, plan);
     try w.writeAll("\n");
 
     // === Line 2: Cost + Block ===
@@ -468,6 +811,30 @@ test "formatCurrency normal" {
 test "formatCurrency negative" {
     var buf: [32]u8 = undefined;
     try std.testing.expectEqualStrings("$0.00", formatCurrency(&buf, -1.0));
+}
+
+// --- formatTokens ---
+
+test "formatTokens below 1000 raw" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("0", formatTokens(&buf, 0));
+    try std.testing.expectEqualStrings("850", formatTokens(&buf, 850));
+    try std.testing.expectEqualStrings("999", formatTokens(&buf, 999));
+}
+
+test "formatTokens thousands floored" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1k", formatTokens(&buf, 1000));
+    try std.testing.expectEqualStrings("1k", formatTokens(&buf, 1999));
+    try std.testing.expectEqualStrings("126k", formatTokens(&buf, 126456));
+    try std.testing.expectEqualStrings("200k", formatTokens(&buf, 200000));
+    try std.testing.expectEqualStrings("999k", formatTokens(&buf, 999999));
+}
+
+test "formatTokens millions" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("1M", formatTokens(&buf, 1_000_000));
+    try std.testing.expectEqualStrings("1.2M", formatTokens(&buf, 1_234_567));
 }
 
 // --- contextColor ---
@@ -593,6 +960,36 @@ test "truncateBranch UTF-8 boundary" {
     try std.testing.expectEqualStrings("ab\xe2\x80\xa6", result);
 }
 
+test "truncateBranch backs a torn cluster up to a complete boundary" {
+    var buf: [256]u8 = undefined;
+    // "👩‍💻👩‍💻" cut inside the second cluster backs up to the first one.
+    const zwj = truncateBranch(&buf, "👩‍💻👩‍💻", 16);
+    try std.testing.expectEqualStrings("👩‍💻\xe2\x80\xa6", zwj); // 👩‍💻…
+    // When not even the first cluster fits, only the ellipsis remains.
+    const tiny = truncateBranch(&buf, "👩‍💻👩‍💻", 8);
+    try std.testing.expectEqualStrings("\xe2\x80\xa6", tiny); // …
+    // "1️⃣2️⃣" cut mid-keycap backs up to the whole first keycap.
+    const keycap = truncateBranch(&buf, "1\xef\xb8\x8f\xe2\x83\xa32\xef\xb8\x8f\xe2\x83\xa3", 12);
+    try std.testing.expectEqualStrings("1\xef\xb8\x8f\xe2\x83\xa3\xe2\x80\xa6", keycap); // 1️⃣…
+}
+
+test "truncateBranch keeps complete trailing graphemes" {
+    var buf: [256]u8 = undefined;
+    // A combining accent right before the cut belongs to a complete é.
+    const accent = truncateBranch(&buf, "cafe\xcc\x81xxxxx", 7);
+    try std.testing.expectEqualStrings("cafe\xcc\x81\xe2\x80\xa6", accent); // café…
+    // A complete keycap right before the cut is kept whole.
+    const keycap = truncateBranch(&buf, "1\xef\xb8\x8f\xe2\x83\xa3abcd", 8);
+    try std.testing.expectEqualStrings("1\xef\xb8\x8f\xe2\x83\xa3\xe2\x80\xa6", keycap); // 1️⃣…
+}
+
+test "truncateBranch drops a torn half flag" {
+    var buf: [256]u8 = undefined;
+    // "🇯🇵🇺🇸" cut after the third regional indicator keeps whole flags only.
+    const flags = truncateBranch(&buf, "🇯🇵🇺🇸", 13);
+    try std.testing.expectEqualStrings("\xf0\x9f\x87\xaf\xf0\x9f\x87\xb5\xe2\x80\xa6", flags); // 🇯🇵…
+}
+
 test "truncateBranch at branch_max_upper does not overflow buf" {
     var buf: [256]u8 = undefined;
     var branch: [300]u8 = undefined;
@@ -667,6 +1064,96 @@ test "printOutput line1 no agent name does not emit puzzle emoji" {
     try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
     const out = aw.writer.buffered();
     try std.testing.expect(!contains(out, "\xf0\x9f\xa7\xa9")); // 🧩
+}
+
+test "printOutput line1 effort level with lightning emoji in dim" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const theme = theme_catppuccin_mocha;
+    const info = StdinInfo{ .model_name = "Fable", .effort_level = "xhigh" };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    try std.testing.expect(contains(aw.writer.buffered(), theme.dim ++ "\xe2\x9a\xa1xhigh")); // ⚡
+}
+
+test "printOutput line1 no effort omits lightning emoji" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .model_name = "Fable" };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expect(!contains(aw.writer.buffered(), "\xe2\x9a\xa1")); // ⚡
+}
+
+test "printOutput line1 session name with name badge emoji in model color" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const theme = theme_catppuccin_mocha;
+    const info = StdinInfo{ .model_name = "Fable", .session_name = "my-session" };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "\xf0\x9f\x93\x9b")); // 📛
+    try std.testing.expect(contains(out, theme.model ++ "my-session"));
+}
+
+test "printOutput line1 long session name truncated" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .session_name = "my-very-long-session-name-that-overflows" };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "my-very-long-session-na\xe2\x80\xa6")); // …
+    try std.testing.expect(!contains(out, "overflows"));
+}
+
+test "printOutput line1 no session name omits name badge emoji" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .model_name = "Fable" };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expect(!contains(aw.writer.buffered(), "\xf0\x9f\x93\x9b")); // 📛
+}
+
+test "printOutput line1 token counts next to percentage" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{
+        .context_pct = 8.0,
+        .context_tokens = 15500,
+        .context_window_size = 200000,
+    };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "8%"));
+    try std.testing.expect(contains(out, "15k/200k"));
+}
+
+test "printOutput line1 token counts with 1M window" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{
+        .context_pct = 13.0,
+        .context_tokens = 126456,
+        .context_window_size = 1_000_000,
+    };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expect(contains(aw.writer.buffered(), "126k/1M"));
+}
+
+test "printOutput line1 no token counts without context_window_size" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .context_pct = 8.0, .context_tokens = 15500 };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expect(!contains(aw.writer.buffered(), "15k"));
+}
+
+test "printOutput line1 no token counts when context_pct null" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .context_tokens = 15500, .context_window_size = 200000 };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "N/A"));
+    try std.testing.expect(!contains(out, "200k"));
 }
 
 test "printOutput line1 exceeds_200k_tokens shows alarm emoji" {
@@ -1060,6 +1547,13 @@ test "parseLayout fallback and parsing" {
     try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, parseLayout("30"));
 }
 
+test "parseColumns" {
+    try std.testing.expectEqual(@as(?u16, null), parseColumns(null));
+    try std.testing.expectEqual(@as(?u16, null), parseColumns("not-a-number"));
+    try std.testing.expectEqual(@as(?u16, null), parseColumns("99999")); // overflow u16
+    try std.testing.expectEqual(@as(?u16, 80), parseColumns("80"));
+}
+
 // --- bar hiding (bar_width == 0) ---
 
 test "printOutput hides context bar when bar_width 0" {
@@ -1074,6 +1568,68 @@ test "printOutput hides context bar when bar_width 0" {
     try std.testing.expect(!contains(out, theme.bar_filled)); // █ gone
     try std.testing.expect(!contains(out, theme.bar_empty)); // ░ gone
     try std.testing.expect(!contains(out, "  ")); // no double space left behind
+}
+
+test "printOutput keeps token counts at tight COLUMNS when names are short" {
+    // Dynamic planning: short session/branch leave room for tokens even at 80.
+    var theme = theme_default;
+    theme.bar_width = layoutForColumns(80).bar_width;
+    theme.cols = 80;
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{
+        .model_name = "Sonnet 4.5",
+        .effort_level = "xhigh",
+        .session_name = "abc",
+        .context_pct = 63.0,
+        .context_tokens = 126_456,
+        .context_window_size = 200_000,
+    };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, "main");
+    try std.testing.expect(contains(aw.writer.buffered(), "126k/200k"));
+}
+
+test "printOutput drops token counts before names at tight COLUMNS" {
+    var theme = theme_default;
+    theme.bar_width = layoutForColumns(80).bar_width;
+    theme.cols = 80;
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = worstCaseLine1Info("Sonnet 4.5", null);
+    info.context_pct = 63.0;
+    info.context_tokens = 126_456;
+    try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+    const out = aw.writer.buffered();
+    try std.testing.expect(!contains(out, "126k")); // tokens dropped first
+    try std.testing.expect(contains(out, "session-nam\xe2\x80\xa6")); // names at cap 12
+    try std.testing.expect(contains(out, "63%")); // percentage kept
+}
+
+test "printOutput omits effort at very tight COLUMNS" {
+    var theme = theme_default;
+    theme.bar_width = layoutForColumns(47).bar_width;
+    theme.cols = 47;
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = worstCaseLine1Info("Sonnet 4.5", null);
+    try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+    const out = aw.writer.buffered();
+    try std.testing.expect(!contains(out, "\xe2\x9a\xa1")); // ⚡ dropped
+    try std.testing.expect(contains(out, "\xf0\x9f\x93\x9b")); // 📛 kept
+    try std.testing.expect(contains(out, "\xf0\x9f\x8c\xbf")); // 🌿 kept
+}
+
+test "printOutput omits branch before session at minimal COLUMNS" {
+    var theme = theme_default;
+    theme.bar_width = layoutForColumns(35).bar_width;
+    theme.cols = 35;
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = worstCaseLine1Info("Fable", null);
+    try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+    const out = aw.writer.buffered();
+    try std.testing.expect(!contains(out, "\xf0\x9f\x8c\xbf")); // 🌿 dropped
+    try std.testing.expect(contains(out, "\xf0\x9f\x93\x9b")); // 📛 kept
 }
 
 test "printOutput hides rate-limit bars when bar_width 0" {
@@ -1091,29 +1647,6 @@ test "printOutput hides rate-limit bars when bar_width 0" {
     try std.testing.expect(contains(out, "86%"));
     try std.testing.expect(!contains(out, theme.bar_filled));
     try std.testing.expect(!contains(out, "  "));
-}
-
-/// Terminal display width: strips ANSI CSI escapes and counts emoji (the only
-/// codepoints we emit above the BMP) as 2 columns, everything else as 1.
-fn displayWidth(s: []const u8) usize {
-    var width: usize = 0;
-    var i: usize = 0;
-    while (i < s.len) {
-        if (s[i] == 0x1b and i + 1 < s.len and s[i + 1] == '[') {
-            i += 2;
-            while (i < s.len and (s[i] < 0x40 or s[i] > 0x7e)) i += 1; // params
-            if (i < s.len) i += 1; // final byte
-            continue;
-        }
-        const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const cp = std.unicode.utf8Decode(s[i..][0..len]) catch {
-            i += 1;
-            continue;
-        };
-        width += if (cp >= 0x1F000) @as(usize, 2) else 1;
-        i += len;
-    }
-    return width;
 }
 
 /// Render the worst-case rate-limit output for `cols` and return the rendered
@@ -1151,6 +1684,276 @@ test "rate-limit line fits within COLUMNS at every breakpoint" {
         defer aw.deinit();
         const line = try renderWorstCaseRateLimit(&aw, cols);
         try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+/// Worst-case line-1 input: everything the planner controls at its cap —
+/// effort "xhigh", a long session name, 100% context with token counts, and
+/// the 🚨 marker. Model and agent names come from the caller since the
+/// planner must budget their actual widths.
+fn worstCaseLine1Info(model: []const u8, agent: ?[]const u8) StdinInfo {
+    return .{
+        .model_name = model,
+        .agent_name = agent,
+        .effort_level = "xhigh",
+        .session_name = "session-name-that-is-really-long",
+        .context_pct = 100.0,
+        .context_tokens = 200_000,
+        .context_window_size = 200_000,
+        .exceeds_200k_tokens = true,
+    };
+}
+
+const worst_case_branch = "feature/branch-that-is-really-long";
+
+/// Render the worst-case line 1 for `cols` and return it. Mirrors how
+/// `initTheme` derives the theme from `COLUMNS`.
+fn renderWorstCaseLine1(aw: *Writer.Allocating, cols: u16, model: []const u8, agent: ?[]const u8) ![]const u8 {
+    var theme = theme_default;
+    const layout = layoutForColumns(cols);
+    theme.bar_width = layout.bar_width;
+    theme.reset_info = layout.reset_info;
+    theme.cols = cols;
+    try printOutput(&aw.writer, theme, worstCaseLine1Info(model, agent), null, 0, 0, worst_case_branch);
+    var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+    return it.next() orelse "";
+}
+
+test "displayWidth counts East Asian wide chars as 2 columns" {
+    // Pins the metric itself: the planner trusts displayWidth, so a metric
+    // regression is invisible to the pipeline tests below.
+    try std.testing.expectEqual(@as(usize, 6), displayWidth("日本語"));
+    try std.testing.expectEqual(@as(usize, 18), displayWidth("日本語日本語日本語"));
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("ab日")); // 1+1+2
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("ＡＢ")); // fullwidth forms
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("한")); // Hangul syllable
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("\xe2\x80\xa6")); // … stays narrow
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\x9a\xa1")); // ⚡
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xf0\x9f\xa4\x96")); // 🤖
+}
+
+test "displayWidth counts BMP emoji with EAW wide as 2 columns" {
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\x8f\xb0")); // ⏰ U+23F0
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\x8c\x9a")); // ⌚ U+231A
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\xad\x90")); // ⭐ U+2B50
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\x9c\x85")); // ✅ U+2705
+    // EAW-narrow symbols stay at 1 column.
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("\xe2\x98\x80")); // ☀ U+2600
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("\xe2\x86\x92")); // → U+2192
+}
+
+test "displayWidth counts supplementary wide scripts as 2 columns" {
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xf0\x96\xbf\xa0")); // U+16FE0 Tangut iteration mark
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xf0\x9b\x80\x80")); // U+1B000 archaic kana
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xf0\x9b\x8b\xbb")); // U+1B2FB Nushu (band upper bound)
+    // Supplementary EAW-narrow codepoints stay at 1 column.
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("\xf0\x9d\x90\x80")); // U+1D400 mathematical bold A
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("\xf0\x90\x80\x80")); // U+10000 Linear B
+}
+
+test "wide_bmp_ranges are sorted and non-overlapping" {
+    // isDoubleWidth's early exit depends on this ordering.
+    for (wide_bmp_ranges, 0..) |range, i| {
+        try std.testing.expect(range[0] <= range[1]);
+        if (i > 0) try std.testing.expect(range[0] > wide_bmp_ranges[i - 1][1]);
+    }
+}
+
+test "zero_width_ranges are sorted and non-overlapping" {
+    // isZeroWidth's early exit depends on this ordering.
+    for (zero_width_ranges, 0..) |range, i| {
+        try std.testing.expect(range[0] <= range[1]);
+        if (i > 0) try std.testing.expect(range[0] > zero_width_ranges[i - 1][1]);
+    }
+}
+
+test "displayWidth charges joiners and combining marks zero columns" {
+    try std.testing.expectEqual(@as(usize, 0), displayWidth("\xe2\x80\x8d")); // ZWJ alone
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("👩‍💻")); // emoji + ZWJ + emoji
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("e\xcc\x81")); // e + combining acute
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\x9a\xa1\xef\xb8\x8f")); // ⚡ + VS16
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe9\x82\x8a\xf3\xa0\x84\x80")); // 邊 + U+E0100 (IVS)
+    // Policy pin: a flag stays 2+2 — grapheme clustering is not modeled, so
+    // regional-indicator pairs count as two emoji (safe on non-clustering
+    // terminals).
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("🇯🇵"));
+}
+
+test "displayWidth upgrades VS16 and keycap sequences to emoji width" {
+    // ☀ is EAW-narrow, but VS16 turns it into a 2-column emoji.
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("\xe2\x98\x80\xef\xb8\x8f")); // ☀️
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("1\xef\xb8\x8f\xe2\x83\xa3")); // 1️⃣
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("#\xe2\x83\xa3")); // keycap without VS16
+    try std.testing.expectEqual(@as(usize, 4), displayWidth("\xe2\x98\x80\xef\xb8\x8f\xe2\x98\x80\xef\xb8\x8f")); // ☀️☀️
+    // VS15 requests text presentation: stays narrow.
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("\xe2\x98\x80\xef\xb8\x8e")); // ☀︎
+}
+
+test "line 1 fits within COLUMNS with fullwidth session name" {
+    // Regression: CJK renders at 2 columns; counting it as 1 made the planner
+    // overestimate the remaining space (e.g. 82 actual columns at COLUMNS=80).
+    const widths = [_]u16{ 100, 90, 85, 80, 69, 63 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var theme = theme_default;
+        const layout = layoutForColumns(cols);
+        theme.bar_width = layout.bar_width;
+        theme.reset_info = layout.reset_info;
+        theme.cols = cols;
+        var info = worstCaseLine1Info("Sonnet 4.5", null);
+        info.session_name = "日本語日本語日本語";
+        try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+        var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+        const line = it.next() orelse "";
+        try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+test "line 1 fits within COLUMNS with BMP-emoji session name" {
+    // Regression: ⏰ (U+23F0) is EAW wide but sits outside the CJK ranges;
+    // counting it as 1 column wrapped the line (e.g. 82 actual at COLUMNS=80).
+    const widths = [_]u16{ 100, 90, 85, 80, 69, 63 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var theme = theme_default;
+        const layout = layoutForColumns(cols);
+        theme.bar_width = layout.bar_width;
+        theme.reset_info = layout.reset_info;
+        theme.cols = cols;
+        var info = worstCaseLine1Info("Sonnet 4.5", null);
+        info.session_name = "⏰⏰⏰⏰⏰⏰⏰⏰";
+        try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+        var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+        const line = it.next() orelse "";
+        try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+test "line 1 fits within COLUMNS with supplementary wide session name" {
+    // Regression: U+16FE0 (Tangut) is EAW wide but sits below U+1F000 and
+    // outside the BMP table; counting it as 1 column wrapped the line
+    // (e.g. 83 actual columns at COLUMNS=80).
+    const widths = [_]u16{ 100, 90, 80, 69, 63, 56 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var theme = theme_default;
+        const layout = layoutForColumns(cols);
+        theme.bar_width = layout.bar_width;
+        theme.reset_info = layout.reset_info;
+        theme.cols = cols;
+        var info = worstCaseLine1Info("Sonnet 4.5", null);
+        info.session_name = "\xf0\x96\xbf\xa0" ** 8; // U+16FE0 × 8
+        try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+        var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+        const line = it.next() orelse "";
+        try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+test "line 1 keeps ZWJ session name and tokens at tight COLUMNS" {
+    // Regression: charging ZWJ one column made the planner overestimate the
+    // line (56 counted vs 54 rendered at COLUMNS=54) and truncate the
+    // session name even though everything fit.
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    const layout = layoutForColumns(54);
+    theme.bar_width = layout.bar_width;
+    theme.reset_info = layout.reset_info;
+    theme.cols = 54;
+    const info = StdinInfo{
+        .model_name = "Sonnet 4.5",
+        .effort_level = "xhigh",
+        .session_name = "👩‍💻👩‍💻",
+        .context_pct = 63.0,
+        .context_tokens = 126_456,
+        .context_window_size = 200_000,
+    };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+    const line = it.next() orelse "";
+    try std.testing.expect(contains(line, "👩‍💻👩‍💻")); // full session name kept
+    try std.testing.expect(!contains(line, "\xe2\x80\xa6")); // no … truncation
+    try std.testing.expect(contains(line, "126k/200k")); // tokens kept
+    try std.testing.expect(displayWidth(line) <= 54);
+}
+
+test "line 1 fits within COLUMNS with VS16-emoji session name" {
+    // Regression: ☀️ (EAW-narrow base + VS16) was counted as 1 column but
+    // renders as 2, so the planner emitted 53 actual columns at COLUMNS=50.
+    const widths = [_]u16{ 80, 63, 56, 52, 50, 44 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var theme = theme_default;
+        const layout = layoutForColumns(cols);
+        theme.bar_width = layout.bar_width;
+        theme.reset_info = layout.reset_info;
+        theme.cols = cols;
+        var info = worstCaseLine1Info("Sonnet 4.5", null);
+        info.session_name = "☀️" ** 6;
+        try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
+        var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+        const line = it.next() orelse "";
+        try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+test "line 1 never leaves dangling joiners before the ellipsis" {
+    // Regression: byte-boundary truncation could cut a ZWJ sequence or
+    // keycap right after its joiner, e.g. "👩‍…" at COLUMNS=40.
+    const widths = [_]u16{ 60, 56, 52, 48, 44, 40, 36 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        var theme = theme_default;
+        const layout = layoutForColumns(cols);
+        theme.bar_width = layout.bar_width;
+        theme.reset_info = layout.reset_info;
+        theme.cols = cols;
+        var info = worstCaseLine1Info("Sonnet 4.5", null);
+        info.session_name = "👩‍💻👩‍💻";
+        const keycap_branch = "1\xef\xb8\x8f\xe2\x83\xa32\xef\xb8\x8f\xe2\x83\xa33\xef\xb8\x8f\xe2\x83\xa34\xef\xb8\x8f\xe2\x83\xa3"; // 1️⃣2️⃣3️⃣4️⃣
+        try printOutput(&aw.writer, theme, info, null, 0, 0, keycap_branch);
+        var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+        const line = it.next() orelse "";
+        try std.testing.expect(!contains(line, "\xe2\x80\x8d\xe2\x80\xa6")); // no ZWJ + …
+        try std.testing.expect(!contains(line, "\xef\xb8\x8f\xe2\x80\xa6")); // no VS16 + …
+        try std.testing.expect(!contains(line, "\xf0\x9f\x91\xa9\xe2\x80\xa6")); // no torn 👩 + …
+    }
+}
+
+test "line 1 fits within COLUMNS across models, agents, and widths" {
+    const cases = [_]struct { model: []const u8, agent: ?[]const u8 }{
+        .{ .model = "Sonnet 4.5", .agent = null },
+        .{ .model = "Opus 4.8 (1M context)", .agent = null }, // long model
+        .{ .model = "Fable", .agent = "code-reviewer" }, // agent segment
+        .{ .model = "Opus 4.8 (1M context)", .agent = "security-reviewer" },
+    };
+    const widths = [_]u16{ 200, 120, 100, 85, 80, 69, 63, 50, 40, 30 };
+    for (cases) |case| {
+        // The fully-degraded plan is the floor: uncontrolled parts (model,
+        // agent, context, 🚨) can exceed tiny widths on their own.
+        var min_aw: Writer.Allocating = .init(std.testing.allocator);
+        defer min_aw.deinit();
+        try writeLine1(&min_aw.writer, theme_default, worstCaseLine1Info(case.model, case.agent), worst_case_branch, .{
+            .bar_width = 0,
+            .name_cap = 4,
+            .show_tokens = false,
+            .show_effort = false,
+            .show_branch = false,
+            .show_session = false,
+        });
+        const minimal = displayWidth(min_aw.writer.buffered());
+        for (widths) |cols| {
+            var aw: Writer.Allocating = .init(std.testing.allocator);
+            defer aw.deinit();
+            const line = try renderWorstCaseLine1(&aw, cols, case.model, case.agent);
+            try std.testing.expect(displayWidth(line) <= @max(cols, minimal));
+        }
     }
 }
 

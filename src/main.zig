@@ -57,13 +57,18 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
     }
     if (getObjField(root, "context_window")) |ctx| {
         if (ctx.get("used_percentage")) |pct| info.context_pct = getF64(pct);
+        if (ctx.get("context_window_size")) |sz| info.context_window_size = getI64(sz);
         if (getObjField(ctx, "current_usage")) |usage| {
             info.context_tokens = getI64Field(usage, "input_tokens") +
                 getI64Field(usage, "cache_creation_input_tokens") +
                 getI64Field(usage, "cache_read_input_tokens");
+        } else if (ctx.get("total_input_tokens")) |t| {
+            // Same input-only sum as current_usage per the statusline docs
+            info.context_tokens = getI64(t);
         }
     }
     if (root.get("session_id")) |v| info.session_id = getStr(v);
+    if (root.get("session_name")) |v| info.session_name = getStr(v);
     if (root.get("transcript_path")) |v| info.transcript_path = getStr(v);
     if (root.get("cwd")) |v| info.cwd = getStr(v);
 
@@ -75,6 +80,9 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
 
     if (getObjField(root, "agent")) |agent| {
         if (agent.get("name")) |n| info.agent_name = getStr(n);
+    }
+    if (getObjField(root, "effort")) |effort| {
+        if (effort.get("level")) |l| info.effort_level = getStr(l);
     }
     if (root.get("exceeds_200k_tokens")) |v| {
         if (v == .bool) info.exceeds_200k_tokens = v.bool;
@@ -333,6 +341,70 @@ test "parseStdin no agent" {
     defer arena.deinit();
     const info = parseStdin(arena.allocator(), "{\"model\":{\"id\":\"x\"}}");
     try std.testing.expectEqual(@as(?[]const u8, null), info.agent_name);
+}
+
+test "parseStdin effort.level" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"effort":{"level":"xhigh"}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqualStrings("xhigh", info.effort_level.?);
+}
+
+test "parseStdin no effort" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const info = parseStdin(arena.allocator(), "{\"model\":{\"id\":\"x\"}}");
+    try std.testing.expectEqual(@as(?[]const u8, null), info.effort_level);
+}
+
+test "parseStdin session_name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"session_id":"abc-123","session_name":"my-session"}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqualStrings("my-session", info.session_name.?);
+}
+
+test "parseStdin no session_name" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const info = parseStdin(arena.allocator(), "{\"session_id\":\"abc-123\"}");
+    try std.testing.expectEqual(@as(?[]const u8, null), info.session_name);
+}
+
+test "parseStdin context_window_size" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"context_window":{"used_percentage":8.0,"context_window_size":200000}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(@as(?i64, 200000), info.context_window_size);
+}
+
+test "parseStdin context_tokens falls back to total_input_tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"context_window":{"used_percentage":8.0,"total_input_tokens":15234}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(@as(?i64, 15234), info.context_tokens);
+}
+
+test "parseStdin context_tokens prefers current_usage over total_input_tokens" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"context_window":{"total_input_tokens":99999,"current_usage":{"input_tokens":10000,"cache_creation_input_tokens":3000,"cache_read_input_tokens":7000}}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(@as(?i64, 20000), info.context_tokens);
 }
 
 test "parseStdin exceeds_200k_tokens true" {
