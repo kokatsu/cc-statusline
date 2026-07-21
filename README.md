@@ -76,6 +76,16 @@ Override individual colors with ANSI escape sequences:
 | `CC_STATUSLINE_BAR_TRANSITION` | Transition bar character | `▓` |
 | `CC_STATUSLINE_BAR_EMPTY` | Empty bar character | `░` |
 
+### Bar Width
+
+Set `CC_STATUSLINE_BAR_WIDTH` to shrink the progress bars or hide them entirely:
+
+```sh
+export CC_STATUSLINE_BAR_WIDTH=0
+```
+
+The value caps the width derived from the terminal width (`COLUMNS`), so it can only shrink the bars — `0` hides both the context bar and the rate-limit bars.
+
 ### Config Directory
 
 By default, cc-statusline reads from `~/.claude`. Override with:

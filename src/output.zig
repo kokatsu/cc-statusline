@@ -194,6 +194,16 @@ fn parseLayout(val: ?[]const u8) Layout {
     return layoutForColumns(cols);
 }
 
+/// Apply the `CC_STATUSLINE_BAR_WIDTH` override to the `COLUMNS`-derived bar
+/// width. The override can only shrink the bar (`0` hides it) — growing past
+/// the layout width would break the no-wrap budget in `layoutForColumns`.
+/// Absent or unparseable values leave the layout width untouched.
+fn resolveBarWidth(layout_width: u8, val: ?[]const u8) u8 {
+    const s = val orelse return layout_width;
+    const v = std.fmt.parseInt(u8, s, 10) catch return layout_width;
+    return @min(layout_width, v);
+}
+
 pub fn initTheme(env: *const std.process.Environ.Map) Theme {
     var theme = buildTheme(
         env.get("CC_STATUSLINE_THEME"),
@@ -211,7 +221,7 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
         },
     );
     const layout = parseLayout(env.get("COLUMNS"));
-    theme.bar_width = layout.bar_width;
+    theme.bar_width = resolveBarWidth(layout.bar_width, env.get("CC_STATUSLINE_BAR_WIDTH"));
     theme.reset_info = layout.reset_info;
     theme.cols = parseColumns(env.get("COLUMNS"));
     return theme;
@@ -1552,6 +1562,19 @@ test "parseColumns" {
     try std.testing.expectEqual(@as(?u16, null), parseColumns("not-a-number"));
     try std.testing.expectEqual(@as(?u16, null), parseColumns("99999")); // overflow u16
     try std.testing.expectEqual(@as(?u16, 80), parseColumns("80"));
+}
+
+test "resolveBarWidth override only shrinks" {
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, null)); // unset
+    try std.testing.expectEqual(@as(u8, 0), resolveBarWidth(10, "0")); // hides the bar
+    try std.testing.expectEqual(@as(u8, 4), resolveBarWidth(10, "4"));
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, "10"));
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, "12")); // cannot grow
+    try std.testing.expectEqual(@as(u8, 2), resolveBarWidth(2, "6")); // narrow terminal wins
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, "-1"));
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, "300")); // overflow u8
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, "abc"));
+    try std.testing.expectEqual(@as(u8, 10), resolveBarWidth(10, ""));
 }
 
 // --- bar hiding (bar_width == 0) ---
