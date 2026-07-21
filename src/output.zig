@@ -61,6 +61,9 @@ pub const Theme = struct {
     /// Terminal width from `COLUMNS`; `planLine1` fits line 1 into it.
     /// `null` (absent or unparseable) leaves line 1 unconstrained.
     cols: ?u16 = null,
+    /// Render the session name segment on line 1. `initTheme` enables it only
+    /// when `CC_STATUSLINE_SHOW_SESSION=1`.
+    show_session: bool = true,
 };
 
 pub const theme_default = Theme{
@@ -239,6 +242,7 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
     theme.bar_width = resolveBarWidth(layout.bar_width, env.get("CC_STATUSLINE_BAR_WIDTH"));
     theme.reset_info = layout.reset_info;
     theme.cols = parseColumns(env.get("COLUMNS"));
+    theme.show_session = if (env.get("CC_STATUSLINE_SHOW_SESSION")) |v| mem.eql(u8, v, "1") else false;
     return theme;
 }
 
@@ -735,7 +739,7 @@ fn largestFittingCap(theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u
 /// long model or agent name on a very narrow terminal) the minimal plan is
 /// rendered as-is.
 fn planLine1(theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8) Line1Plan {
-    var plan = Line1Plan{ .bar_width = theme.bar_width, .name_cap = theme.branch_max };
+    var plan = Line1Plan{ .bar_width = theme.bar_width, .name_cap = theme.branch_max, .show_session = theme.show_session };
     const cols = theme.cols orelse return plan;
     if (line1Fits(theme, stdin_info, git_branch, plan, cols)) return plan;
 
@@ -1169,6 +1173,28 @@ test "printOutput line1 long session name truncated" {
     const out = aw.writer.buffered();
     try std.testing.expect(contains(out, "my-very-long-session-na\xe2\x80\xa6")); // …
     try std.testing.expect(!contains(out, "overflows"));
+}
+
+test "printOutput line1 session name hidden when show_session off" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    theme.show_session = false;
+    const info = StdinInfo{ .model_name = "Fable", .session_name = "my-session" };
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(!contains(out, "\xf0\x9f\x93\x9b")); // 📛
+    try std.testing.expect(!contains(out, "my-session"));
+}
+
+test "initTheme hides session name unless CC_STATUSLINE_SHOW_SESSION=1" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expect(!initTheme(&env).show_session);
+    try env.put("CC_STATUSLINE_SHOW_SESSION", "0");
+    try std.testing.expect(!initTheme(&env).show_session);
+    try env.put("CC_STATUSLINE_SHOW_SESSION", "1");
+    try std.testing.expect(initTheme(&env).show_session);
 }
 
 test "printOutput line1 no session name omits name badge emoji" {

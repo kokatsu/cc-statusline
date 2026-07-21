@@ -7,7 +7,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 ## Features
 
 - **Model & Context** — Current model name, reasoning effort level (⚡, tinted per level with Claude Code's rainbow palette; `max` gets a rainbow gradient), git branch, context window usage with color-coded progress bar (green → yellow → red) and token counts (`126k/200k`)
-- **Session Name** — Shows custom session name (📛) set via `--name` or `/rename`
+- **Session Name** — Shows custom session name (📛) set via `--name` or `/rename` (opt-in via `CC_STATUSLINE_SHOW_SESSION=1`)
 - **Subagent Indicator** — Shows current subagent name (🧩) when running inside a Claude Code subagent
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour
@@ -85,6 +85,14 @@ export CC_STATUSLINE_BAR_WIDTH=0
 ```
 
 The value caps the width derived from the terminal width (`COLUMNS`), so it can only shrink the bars — `0` hides both the context bar and the rate-limit bars.
+
+### Session Name
+
+The session name segment (📛) is hidden by default. Set `CC_STATUSLINE_SHOW_SESSION=1` to show it:
+
+```sh
+export CC_STATUSLINE_SHOW_SESSION=1
+```
 
 ### Config Directory
 
