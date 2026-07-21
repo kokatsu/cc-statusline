@@ -108,6 +108,21 @@ pub const theme_catppuccin_macchiato = Theme{
     .dim = "\x1b[38;2;110;115;141m",
 };
 
+// Effort-level colors: Claude Code's own rainbow palette (`rainbow_*` theme
+// colors), so the indicator matches the official UI in every theme. Unknown
+// levels fall back to `theme.dim`.
+const effort_low_color = "\x1b[38;2;250;195;95m"; // rainbow_yellow (#FAC35F)
+const effort_medium_color = "\x1b[38;2;145;200;130m"; // rainbow_green (#91C882)
+const effort_high_color = "\x1b[38;2;130;170;220m"; // rainbow_blue (#82AADC)
+const effort_xhigh_color = "\x1b[38;2;200;130;180m"; // rainbow_violet (#C882B4)
+/// "max" renders as a static rainbow: one color per glyph of "⚡max".
+const effort_max_colors = [4][]const u8{
+    "\x1b[38;2;235;95;87m", // rainbow_red (#EB5F57)
+    "\x1b[38;2;250;195;95m", // rainbow_yellow (#FAC35F)
+    "\x1b[38;2;145;200;130m", // rainbow_green (#91C882)
+    "\x1b[38;2;130;170;220m", // rainbow_blue (#82AADC)
+};
+
 pub const ThemeOverrides = struct {
     model: ?[]const u8 = null,
     agent: ?[]const u8 = null,
@@ -604,6 +619,14 @@ fn displayWidth(s: []const u8) usize {
     return width;
 }
 
+fn effortColor(theme: Theme, level: []const u8) []const u8 {
+    if (mem.eql(u8, level, "low")) return effort_low_color;
+    if (mem.eql(u8, level, "medium")) return effort_medium_color;
+    if (mem.eql(u8, level, "high")) return effort_high_color;
+    if (mem.eql(u8, level, "xhigh")) return effort_xhigh_color;
+    return theme.dim;
+}
+
 fn writeLine1(w: *Writer, theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8, plan: Line1Plan) !void {
     const model_name = stdin_info.model_name orelse "Unknown";
     try w.print("\xf0\x9f\xa4\x96 {s}{s}{s}", .{ theme.model, model_name, theme.reset });
@@ -612,7 +635,12 @@ fn writeLine1(w: *Writer, theme: Theme, stdin_info: StdinInfo, git_branch: ?[]co
     if (plan.show_effort) {
         if (stdin_info.effort_level) |level| {
             // ⚡ U+26A1
-            try w.print(" {s}\xe2\x9a\xa1{s}{s}", .{ theme.dim, level, theme.reset });
+            if (mem.eql(u8, level, "max")) {
+                const c = effort_max_colors;
+                try w.print(" {s}\xe2\x9a\xa1{s}m{s}a{s}x{s}", .{ c[0], c[1], c[2], c[3], theme.reset });
+            } else {
+                try w.print(" {s}\xe2\x9a\xa1{s}{s}", .{ effortColor(theme, level), level, theme.reset });
+            }
         }
     }
 
@@ -1076,13 +1104,42 @@ test "printOutput line1 no agent name does not emit puzzle emoji" {
     try std.testing.expect(!contains(out, "\xf0\x9f\xa7\xa9")); // 🧩
 }
 
-test "printOutput line1 effort level with lightning emoji in dim" {
+test "printOutput line1 effort level colored per level" {
+    const cases = [_]struct { level: []const u8, color: []const u8 }{
+        .{ .level = "low", .color = effort_low_color },
+        .{ .level = "medium", .color = effort_medium_color },
+        .{ .level = "high", .color = effort_high_color },
+        .{ .level = "xhigh", .color = effort_xhigh_color },
+    };
+    for (cases) |case| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        const info = StdinInfo{ .model_name = "Fable", .effort_level = case.level };
+        try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+        var expected_buf: [64]u8 = undefined;
+        // ⚡ U+26A1
+        const expected = try std.fmt.bufPrint(&expected_buf, "{s}\xe2\x9a\xa1{s}", .{ case.color, case.level });
+        try std.testing.expect(contains(aw.writer.buffered(), expected));
+    }
+}
+
+test "printOutput line1 effort max rainbow per glyph" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{ .model_name = "Fable", .effort_level = "max" };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const expected = effort_max_colors[0] ++ "\xe2\x9a\xa1" ++ effort_max_colors[1] ++ "m" ++
+        effort_max_colors[2] ++ "a" ++ effort_max_colors[3] ++ "x"; // ⚡max
+    try std.testing.expect(contains(aw.writer.buffered(), expected));
+}
+
+test "printOutput line1 unknown effort level falls back to dim" {
     var aw: Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
     const theme = theme_catppuccin_mocha;
-    const info = StdinInfo{ .model_name = "Fable", .effort_level = "xhigh" };
+    const info = StdinInfo{ .model_name = "Fable", .effort_level = "turbo" };
     try printOutput(&aw.writer, theme, info, null, 0, 0, null);
-    try std.testing.expect(contains(aw.writer.buffered(), theme.dim ++ "\xe2\x9a\xa1xhigh")); // ⚡
+    try std.testing.expect(contains(aw.writer.buffered(), theme.dim ++ "\xe2\x9a\xa1turbo")); // ⚡
 }
 
 test "printOutput line1 no effort omits lightning emoji" {
