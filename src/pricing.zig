@@ -60,6 +60,16 @@ pub const pricing_table = [_]ModelPricing{
     .{ .prefix = "claude-fable-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
     // Mythos 5 (limited availability; same rates as Fable 5)
     .{ .prefix = "claude-mythos-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
+    // Opus 5 (1M context at standard pricing; fast mode $10/$50 per MTok)
+    .{
+        .prefix = "claude-opus-5",
+        .input = 5e-6,
+        .output = 25e-6,
+        .cache_creation_5m = 6.25e-6,
+        .cache_creation_1h = 10e-6,
+        .cache_read = 5e-7,
+        .fast = .{ .input = 1e-5, .output = 5e-5 },
+    },
     // Opus 4.7 (1M context at standard pricing; fast mode $30/$150 per MTok)
     .{
         .prefix = "claude-opus-4-7",
@@ -211,6 +221,47 @@ test "findPricing" {
     try std.testing.expect(p2.?.input_above_200k != null);
 
     try std.testing.expect(findPricing("unknown-model") == null);
+}
+
+test "calculateEntryCost opus 5 all five rates" {
+    const p = findPricing("claude-opus-5[1m]").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage, 0);
+    // 1000*5e-6 + 500*25e-6 + 2000*6.25e-6 + 3000*10e-6 + 4000*5e-7
+    // = 0.005 + 0.0125 + 0.0125 + 0.03 + 0.002 = 0.062
+    try std.testing.expectApproxEqAbs(@as(f64, 0.062), cost, 1e-10);
+}
+
+test "calculateEntryCost opus 5 fast mode uses explicit fast rates" {
+    const p = findPricing("claude-opus-5").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .is_fast = true,
+    };
+    const cost = calculateEntryCost(p, usage, 0);
+    // 1000 * 1e-5 (fast.input) + 500 * 5e-5 (fast.output) = 0.01 + 0.025 = 0.035
+    try std.testing.expectApproxEqAbs(@as(f64, 0.035), cost, 1e-10);
+}
+
+test "calculateEntryCost opus 5 over 200k uses base rate" {
+    // 1M context is billed at standard rates — no above-200k premium tier.
+    const p = findPricing("claude-opus-5").?;
+    try std.testing.expectEqual(@as(?f64, null), p.input_above_200k);
+    try std.testing.expectEqual(@as(?IntroRates, null), p.intro);
+    const usage = TokenUsage{
+        .input_tokens = 300_000,
+        .output_tokens = 1000,
+    };
+    const cost = calculateEntryCost(p, usage, 0);
+    // base rate: 300_000 * 5e-6 + 1000 * 25e-6 = 1.5 + 0.025 = 1.525
+    try std.testing.expectApproxEqAbs(@as(f64, 1.525), cost, 1e-10);
 }
 
 test "calculateEntryCost opus 4.8 fast mode uses explicit fast rates" {
@@ -570,6 +621,8 @@ test "findPricing all model prefixes" {
         .{ .model = "claude-fable-5-20260601", .prefix = "claude-fable-5" },
         .{ .model = "claude-fable-5[1m]", .prefix = "claude-fable-5" },
         .{ .model = "claude-mythos-5[1m]", .prefix = "claude-mythos-5" },
+        .{ .model = "claude-opus-5", .prefix = "claude-opus-5" },
+        .{ .model = "claude-opus-5[1m]", .prefix = "claude-opus-5" },
         .{ .model = "claude-opus-4-8", .prefix = "claude-opus-4-8" },
         .{ .model = "claude-opus-4-7-20260101", .prefix = "claude-opus-4-7" },
         .{ .model = "claude-opus-4-6-20251212", .prefix = "claude-opus-4-6" },
@@ -609,6 +662,11 @@ test "findPricing prefix ordering specific sonnet-4 variants before generic sonn
 test "findPricing sonnet-5 and sonnet-4 do not collide" {
     try std.testing.expectEqualStrings("claude-sonnet-5", findPricing("claude-sonnet-5-20260615").?.prefix);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", findPricing("claude-sonnet-4-6-20251212").?.prefix);
+}
+
+test "findPricing opus-5 and opus-4 do not collide" {
+    try std.testing.expectEqualStrings("claude-opus-5", findPricing("claude-opus-5-20260701").?.prefix);
+    try std.testing.expectEqualStrings("claude-opus-4-8", findPricing("claude-opus-4-8").?.prefix);
 }
 
 test "findPricing prefix ordering specific opus-4 variants before generic opus-4" {
