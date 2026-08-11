@@ -640,7 +640,7 @@ fn parseJsonlLine(
 
 fn entryCost(entry: TranscriptEntry) f64 {
     const p = pricing.findPricing(entry.model) orelse return 0;
-    return pricing.calculateEntryCost(p, entry.usage, entry.timestamp_ms);
+    return pricing.calculateEntryCost(p, entry.usage);
 }
 
 /// Build the cache tail for one file: the `tail_max` unique messages with the
@@ -1383,7 +1383,7 @@ test "computeCosts today entries only" {
     const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
     const result = computeCosts(&entries, now_ms, day_start_ms, null);
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_today = pricing.calculateEntryCost(p, today_entry.usage, today_entry.timestamp_ms);
+    const expected_today = pricing.calculateEntryCost(p, today_entry.usage);
     try std.testing.expectApproxEqAbs(expected_today, result.today_cost, 1e-10);
 }
 
@@ -1651,7 +1651,7 @@ test "computeBlockFromWindow entries within window" {
     try std.testing.expect(block != null);
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_cost = pricing.calculateEntryCost(p, inside.usage, inside.timestamp_ms);
+    const expected_cost = pricing.calculateEntryCost(p, inside.usage);
     try std.testing.expectApproxEqAbs(expected_cost, block.?.cost, 1e-10);
     try std.testing.expectEqual(window_start, block.?.start_ms);
     try std.testing.expectEqual(window_end, block.?.end_ms);
@@ -1697,7 +1697,7 @@ test "computeCosts with resets_at_ms uses window" {
     try std.testing.expectEqual(resets_at_ms, result.block.?.end_ms);
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_cost = pricing.calculateEntryCost(p, in_window.usage, in_window.timestamp_ms);
+    const expected_cost = pricing.calculateEntryCost(p, in_window.usage);
     try std.testing.expectApproxEqAbs(expected_cost, result.block.?.cost, 1e-10);
 }
 
@@ -2141,7 +2141,7 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
     const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
         return error.TestUnexpectedResult;
-    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 }, 0);
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 });
     try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
     // The active block contains both snapshots, so its cost is replaced too.
     try std.testing.expectApproxEqAbs(expected, result.block.?.cost, 1e-9);
@@ -2152,7 +2152,7 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     const cached2 = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
     const result2 = diffScan(alloc, cached2, now_ms, now_s, day_start_ms, null, cp) orelse
         return error.TestUnexpectedResult;
-    const expected2 = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 }, 0);
+    const expected2 = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 });
     try std.testing.expectApproxEqAbs(expected2, result2.today_cost, 1e-9);
 }
 
@@ -2211,8 +2211,8 @@ test "diffScan replaces snapshot even when many messages interleave before final
         return error.TestUnexpectedResult;
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const filler = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 100 }, 0);
-    const x_final = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 }, 0);
+    const filler = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 100 });
+    const x_final = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 });
     const expected = @as(f64, @floatFromInt(tail_max + 1)) * filler + x_final;
     try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
 }
@@ -2260,8 +2260,8 @@ test "diffScan falls back to fullScan when appended lines replay old history" {
 
     // The fullScan fallback collapses the replayed line via dedup.
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 500 }, 0) +
-        pricing.calculateEntryCost(p, .{ .input_tokens = 2000, .output_tokens = 300 }, 0);
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 500 }) +
+        pricing.calculateEntryCost(p, .{ .input_tokens = 2000, .output_tokens = 300 });
     const rescanned = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
     try std.testing.expectApproxEqAbs(expected, rescanned.today_cost, 1e-9);
 }
@@ -2344,7 +2344,7 @@ test "identifyActiveBlock identical timestamps" {
     try std.testing.expect(block != null);
     // Both entries in same block, costs should be combined
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, entries[0].usage, entries[0].timestamp_ms) + pricing.calculateEntryCost(p, entries[1].usage, entries[1].timestamp_ms);
+    const expected = pricing.calculateEntryCost(p, entries[0].usage) + pricing.calculateEntryCost(p, entries[1].usage);
     try std.testing.expectApproxEqAbs(expected, block.?.cost, 1e-10);
 }
 
@@ -2361,7 +2361,7 @@ test "identifyActiveBlock exactly at block duration stays in block" {
     try std.testing.expect(block != null);
     // Both entries should be in the same block since condition is `>`
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, entries[0].usage, entries[0].timestamp_ms) + pricing.calculateEntryCost(p, entries[1].usage, entries[1].timestamp_ms);
+    const expected = pricing.calculateEntryCost(p, entries[0].usage) + pricing.calculateEntryCost(p, entries[1].usage);
     try std.testing.expectApproxEqAbs(expected, block.?.cost, 1e-10);
 }
 
@@ -2402,7 +2402,7 @@ test "identifyActiveBlock multiple gaps picks last block" {
     try std.testing.expect(block != null);
     // Only the last entry should be in the block
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 3000, .output_tokens = 1500 }, entries[2].timestamp_ms);
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 3000, .output_tokens = 1500 });
     try std.testing.expectApproxEqAbs(expected, block.?.cost, 1e-10);
 }
 
