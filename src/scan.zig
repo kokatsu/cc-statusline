@@ -46,7 +46,7 @@ const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
 
 const cache_magic = [4]u8{ 'C', 'C', 'S', 'L' };
-const cache_ver: u32 = 7;
+const cache_ver: u32 = 8;
 const file_list_ttl_s: i64 = 300;
 // Actual caches are ~tens of KB; cap at 1 MiB to fail fast on corruption.
 const cache_max_bytes: usize = 1 * 1024 * 1024;
@@ -75,6 +75,11 @@ pub const TranscriptEntry = struct {
     /// Lets scans that consume the entries later (tail bookkeeping in
     /// diffScan) refer back to the message without re-parsing the line.
     dedup_hash: u64 = 0,
+    /// Cost of the `usage.iterations[]` advisor calls attached to this
+    /// message, already priced per element at its own model's rates. Kept as
+    /// a cost rather than a model+usage pair so a line mixing advisor models
+    /// is not collapsed onto a single rate.
+    advisor_cost: f64 = 0,
 };
 
 /// Snapshot of a recently parsed entry, persisted in the cache per file so a
@@ -299,6 +304,40 @@ const SaxScanner = struct {
         return true;
     }
 
+    /// Consumes `[` if next, else skips the entire value (covers `null` and
+    /// any non-array). Returns true when the caller should walk elements.
+    fn enterArray(self: *SaxScanner) !bool {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        if (self.input[self.cursor] != '[') {
+            try self.skipValue();
+            return false;
+        }
+        self.cursor += 1;
+        return true;
+    }
+
+    /// Advances to the next array element, consuming any separating `,`.
+    /// Returns false at `]` (consuming it), which also covers `[]`.
+    fn nextElement(self: *SaxScanner) !bool {
+        self.skipWs();
+        if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+        if (self.input[self.cursor] == ']') {
+            self.cursor += 1;
+            return false;
+        }
+        if (self.input[self.cursor] == ',') {
+            self.cursor += 1;
+            self.skipWs();
+            if (self.cursor >= self.input.len) return error.UnexpectedEndOfInput;
+            if (self.input[self.cursor] == ']') {
+                self.cursor += 1;
+                return false;
+            }
+        }
+        return true;
+    }
+
     /// Returns the next object key as an inner slice (no quotes), or null at
     /// `}`. Consumes the trailing `:`. Keys are ASCII-only by schema, so we
     /// scan for the closing `"` directly without escape tracking.
@@ -492,6 +531,14 @@ const Parser = struct {
     /// fallback is ignored once this is set, regardless of key order.
     have_nested_cc: bool = false,
     is_fast: bool = false,
+    /// Raw `cache_creation_input_tokens` as seen on the usage object, kept
+    /// separate from `cc_5m` so the iterations reconciliation can compare
+    /// against it regardless of key order.
+    cc_outer_agg: ?i64 = null,
+    /// Sum of `usage.iterations[]` entries tagged `advisor_message`, each
+    /// priced at its own model's rates. Added to the main-model cost in
+    /// `entryCost`.
+    advisor_cost: f64 = 0,
 
     fn init(line: []const u8) Parser {
         return .{ .scanner = SaxScanner.init(line) };
@@ -529,6 +576,7 @@ const Parser = struct {
     fn parseUsage(self: *Parser) !void {
         if (!try self.scanner.enterObject()) return;
         self.have_usage = true;
+        var iters: Iterations = .{};
         while (try self.scanner.nextKey()) |key| {
             if (mem.eql(u8, key, "input_tokens")) {
                 self.input_tokens = try self.scanner.readI64();
@@ -538,16 +586,143 @@ const Parser = struct {
                 self.cache_read = try self.scanner.readI64();
             } else if (mem.eql(u8, key, "cache_creation_input_tokens")) {
                 const v = try self.scanner.readI64();
+                self.cc_outer_agg = v;
                 if (!self.have_nested_cc) self.cc_5m = v;
             } else if (mem.eql(u8, key, "speed")) {
                 const s = try self.scanner.readString();
                 self.is_fast = if (s) |v| mem.eql(u8, v, "fast") else false;
             } else if (mem.eql(u8, key, "cache_creation")) {
                 try self.parseCacheCreation();
+            } else if (mem.eql(u8, key, "iterations")) {
+                iters = try self.parseIterations();
             } else {
                 try self.scanner.skipValue();
             }
         }
+
+        // Applied after the loop: key order between `cache_creation`,
+        // `cache_creation_input_tokens` and `iterations` is not guaranteed.
+        //
+        // With multiple iterations the outer `cache_creation` object holds
+        // only the first iteration's 5m/1h breakdown while the aggregate
+        // holds the true total. The per-iteration sum is the only source for
+        // the full split, so adopt it — but only when it reconciles with the
+        // aggregate and every element carried a recognised `type`, since an
+        // unknown element could contribute tokens the outer usage never
+        // counted while the arithmetic still balances.
+        if (iters.msg_count > 0 and !iters.unknown_type) {
+            if (self.cc_outer_agg) |agg| {
+                if (iters.msg_cc_5m + iters.msg_cc_1h == agg) {
+                    self.cc_5m = iters.msg_cc_5m;
+                    self.cc_1h = iters.msg_cc_1h;
+                }
+            }
+        }
+    }
+
+    /// Aggregate of one `usage.iterations` array.
+    const Iterations = struct {
+        /// Number of well-formed `type: "message"` elements.
+        msg_count: u32 = 0,
+        msg_cc_5m: i64 = 0,
+        msg_cc_1h: i64 = 0,
+        /// True once an element carried a `type` we do not recognise (or no
+        /// `type` at all, or was not an object). Disables the iteration-derived
+        /// cache_creation split.
+        unknown_type: bool = false,
+    };
+
+    /// Walks `usage.iterations`, costing every `advisor_message` element into
+    /// `advisor_cost` and summing the `message` elements' cache_creation split.
+    ///
+    /// `type` and `model` follow the token fields in the real schema, so each
+    /// element's values are buffered and committed once the element closes.
+    fn parseIterations(self: *Parser) !Iterations {
+        var agg: Iterations = .{};
+        if (!try self.scanner.enterArray()) return agg;
+        while (try self.scanner.nextElement()) {
+            // A stray delimiter (`[}`) leaves both `nextElement` and the
+            // `skipValue` inside `enterObject` at a standstill, so bail out
+            // instead of spinning: the cursor is corrupted either way and
+            // `parseJsonlLine` drops the line like any other malformed one.
+            const before = self.scanner.cursor;
+            if (!try self.scanner.enterObject()) {
+                agg.unknown_type = true;
+                if (self.scanner.cursor == before) return error.UnexpectedToken;
+                continue;
+            }
+            var kind: ?[]const u8 = null;
+            var model: []const u8 = "unknown";
+            var input_tokens: i64 = 0;
+            var output_tokens: i64 = 0;
+            var cache_read: i64 = 0;
+            var cc_agg: i64 = 0;
+            var cc_5m: i64 = 0;
+            var cc_1h: i64 = 0;
+            var nested_cc = false;
+            while (try self.scanner.nextKey()) |key| {
+                if (mem.eql(u8, key, "input_tokens")) {
+                    input_tokens = try self.scanner.readI64();
+                } else if (mem.eql(u8, key, "output_tokens")) {
+                    output_tokens = try self.scanner.readI64();
+                } else if (mem.eql(u8, key, "cache_read_input_tokens")) {
+                    cache_read = try self.scanner.readI64();
+                } else if (mem.eql(u8, key, "cache_creation_input_tokens")) {
+                    cc_agg = try self.scanner.readI64();
+                } else if (mem.eql(u8, key, "cache_creation")) {
+                    // Authoritative only once the object is actually entered:
+                    // a `null` (or any non-object) value must leave the
+                    // aggregate fallback below in force, as the outer
+                    // `parseCacheCreation` already does.
+                    if (try self.scanner.enterObject()) {
+                        nested_cc = true;
+                        cc_5m = 0;
+                        cc_1h = 0;
+                        while (try self.scanner.nextKey()) |ck| {
+                            if (mem.eql(u8, ck, "ephemeral_5m_input_tokens")) {
+                                cc_5m = try self.scanner.readI64();
+                            } else if (mem.eql(u8, ck, "ephemeral_1h_input_tokens")) {
+                                cc_1h = try self.scanner.readI64();
+                            } else {
+                                try self.scanner.skipValue();
+                            }
+                        }
+                    }
+                } else if (mem.eql(u8, key, "type")) {
+                    kind = try self.scanner.readString();
+                } else if (mem.eql(u8, key, "model")) {
+                    if (try self.scanner.readString()) |m| model = m;
+                } else {
+                    try self.scanner.skipValue();
+                }
+            }
+            if (!nested_cc) cc_5m = cc_agg;
+
+            const k = kind orelse {
+                agg.unknown_type = true;
+                continue;
+            };
+            if (mem.eql(u8, k, "message")) {
+                agg.msg_count += 1;
+                agg.msg_cc_5m += cc_5m;
+                agg.msg_cc_1h += cc_1h;
+            } else if (mem.eql(u8, k, "advisor_message")) {
+                // Advisor entries carry no `speed`, so they never inherit the
+                // outer usage's fast flag.
+                if (pricing.findPricing(model)) |pr| {
+                    self.advisor_cost += pricing.calculateEntryCost(pr, .{
+                        .input_tokens = input_tokens,
+                        .output_tokens = output_tokens,
+                        .cache_creation_5m_input_tokens = cc_5m,
+                        .cache_creation_1h_input_tokens = cc_1h,
+                        .cache_read_input_tokens = cache_read,
+                    });
+                }
+            } else {
+                agg.unknown_type = true;
+            }
+        }
+        return agg;
     }
 
     fn parseCacheCreation(self: *Parser) !void {
@@ -620,6 +795,7 @@ fn parseJsonlLine(
             .is_fast = p.is_fast,
         },
         .dedup_hash = dedup_hash,
+        .advisor_cost = p.advisor_cost,
     };
 
     // A same-list duplicate carries a fresher usage snapshot — the final
@@ -639,8 +815,13 @@ fn parseJsonlLine(
 // ============================================================
 
 fn entryCost(entry: TranscriptEntry) f64 {
-    const p = pricing.findPricing(entry.model) orelse return 0;
-    return pricing.calculateEntryCost(p, entry.usage);
+    // An unpriced main model must not discard a known advisor cost, so the
+    // main-model miss contributes 0 instead of returning early.
+    const main_cost = if (pricing.findPricing(entry.model)) |p|
+        pricing.calculateEntryCost(p, entry.usage)
+    else
+        0;
+    return main_cost + entry.advisor_cost;
 }
 
 /// Build the cache tail for one file: the `tail_max` unique messages with the
@@ -2724,4 +2905,274 @@ test "parseJsonlContent golden table" {
         try std.testing.expectEqual(c.want.is_fast, e.usage.is_fast);
         try std.testing.expectEqualStrings(c.want.model, e.model);
     }
+}
+
+// --- usage.iterations (advisor calls) ---
+
+test "parseJsonlContent counts advisor_message iteration on top of the main model" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":1198,"cache_read_input_tokens":171260,"cache_creation_input_tokens":5628,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"iterations":[{"input_tokens":2,"output_tokens":561,"cache_read_input_tokens":82816,"cache_creation_input_tokens":5628,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"type":"message"},{"input_tokens":90249,"output_tokens":15417,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"type":"advisor_message","model":"claude-fable-5"}],"speed":"standard"}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+
+    const opus = pricing.findPricing("claude-opus-5").?;
+    const fable = pricing.findPricing("claude-fable-5").?;
+    const main_cost = pricing.calculateEntryCost(opus, .{
+        .input_tokens = 4,
+        .output_tokens = 1198,
+        .cache_creation_1h_input_tokens = 5628,
+        .cache_read_input_tokens = 171_260,
+    });
+    const advisor_cost = pricing.calculateEntryCost(fable, .{ .input_tokens = 90_249, .output_tokens = 15_417 });
+    try std.testing.expectApproxEqAbs(advisor_cost, entries.items[0].advisor_cost, 1e-12);
+    try std.testing.expectApproxEqAbs(main_cost + advisor_cost, entryCost(entries.items[0]), 1e-12);
+}
+
+test "parseJsonlContent message-only iterations do not double count the main model" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"iterations":[{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":100,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"type":"message"}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+
+    const opus = pricing.findPricing("claude-opus-5").?;
+    const expected = pricing.calculateEntryCost(opus, .{
+        .input_tokens = 10,
+        .output_tokens = 20,
+        .cache_read_input_tokens = 100,
+    });
+    try std.testing.expectApproxEqAbs(0, entries.items[0].advisor_cost, 1e-12);
+    try std.testing.expectApproxEqAbs(expected, entryCost(entries.items[0]), 1e-12);
+}
+
+test "parseJsonlContent takes the cache_creation split from summed message iterations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    // Outer nested cache_creation holds only the first iteration's breakdown
+    // (5628) while the aggregate holds the true total (7819).
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":1198,"cache_read_input_tokens":0,"cache_creation_input_tokens":7819,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"iterations":[{"input_tokens":2,"output_tokens":561,"cache_creation_input_tokens":5628,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"type":"message"},{"input_tokens":2,"output_tokens":637,"cache_creation_input_tokens":2191,"cache_creation":{"ephemeral_5m_input_tokens":2191,"ephemeral_1h_input_tokens":0},"type":"message"}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    try std.testing.expectEqual(@as(i64, 2191), entries.items[0].usage.cache_creation_5m_input_tokens);
+    try std.testing.expectEqual(@as(i64, 5628), entries.items[0].usage.cache_creation_1h_input_tokens);
+}
+
+test "parseJsonlContent keeps the outer cache_creation when iterations do not reconcile" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const cases = [_]struct { line: []const u8 }{
+        // Summed message iterations (100) disagree with the aggregate (7819).
+        .{
+            .line =
+            \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":7819,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"iterations":[{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":100,"cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":0},"type":"message"}]}}}
+            ,
+        },
+        // iterations is null.
+        .{
+            .line =
+            \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r2","message":{"id":"m2","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":7819,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"iterations":null}}}
+            ,
+        },
+        // iterations is an empty array.
+        .{
+            .line =
+            \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r3","message":{"id":"m3","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":7819,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"iterations":[]}}}
+            ,
+        },
+    };
+
+    for (cases) |c| {
+        var seen = DedupSet.empty;
+        var entries: std.ArrayList(TranscriptEntry) = .empty;
+        parseJsonlContent(alloc, alloc, c.line, &entries, &seen);
+        try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+        try std.testing.expectEqual(@as(i64, 0), entries.items[0].usage.cache_creation_5m_input_tokens);
+        try std.testing.expectEqual(@as(i64, 5628), entries.items[0].usage.cache_creation_1h_input_tokens);
+        try std.testing.expectApproxEqAbs(0, entries.items[0].advisor_cost, 1e-12);
+    }
+}
+
+test "parseJsonlContent counts two advisor_message iterations at their own rates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"iterations":[{"input_tokens":1000,"output_tokens":200,"type":"advisor_message","model":"claude-fable-5"},{"input_tokens":3000,"output_tokens":400,"type":"advisor_message","model":"claude-opus-5"}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+
+    const fable = pricing.findPricing("claude-fable-5").?;
+    const opus = pricing.findPricing("claude-opus-5").?;
+    const expected = pricing.calculateEntryCost(fable, .{ .input_tokens = 1000, .output_tokens = 200 }) +
+        pricing.calculateEntryCost(opus, .{ .input_tokens = 3000, .output_tokens = 400 });
+    try std.testing.expectApproxEqAbs(expected, entries.items[0].advisor_cost, 1e-12);
+}
+
+test "parseJsonlContent unknown iteration type is ignored and disables the split" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    // The unknown element carries no tokens, so the message sum still equals
+    // the aggregate — the fallback must come from the unknown `type` itself.
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":7819,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5628},"iterations":[{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":7819,"cache_creation":{"ephemeral_5m_input_tokens":2191,"ephemeral_1h_input_tokens":5628},"type":"message"},{"input_tokens":0,"output_tokens":0,"type":"future_message","model":"claude-fable-5"}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    const e = entries.items[0];
+    try std.testing.expectApproxEqAbs(0, e.advisor_cost, 1e-12);
+    try std.testing.expectEqual(@as(i64, 0), e.usage.cache_creation_5m_input_tokens);
+    try std.testing.expectEqual(@as(i64, 5628), e.usage.cache_creation_1h_input_tokens);
+
+    const opus = pricing.findPricing("claude-opus-5").?;
+    try std.testing.expectApproxEqAbs(pricing.calculateEntryCost(opus, e.usage), entryCost(e), 1e-12);
+}
+
+test "entryCost returns the advisor cost when the main model is unpriced" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"some-future-model","usage":{"input_tokens":4,"output_tokens":10,"iterations":[{"input_tokens":1000,"output_tokens":200,"type":"advisor_message","model":"claude-fable-5"}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+
+    const fable = pricing.findPricing("claude-fable-5").?;
+    const expected = pricing.calculateEntryCost(fable, .{ .input_tokens = 1000, .output_tokens = 200 });
+    try std.testing.expectEqualStrings("unknown", entries.items[0].model);
+    try std.testing.expectApproxEqAbs(expected, entryCost(entries.items[0]), 1e-12);
+}
+
+test "parseJsonlContent streaming placeholder is replaced by the advisor-carrying final line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const content =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":6}}}
+    ++ "\n" ++
+        \\{"timestamp":"2025-06-15T10:00:05Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":1198,"iterations":[{"input_tokens":4,"output_tokens":1198,"type":"message"},{"input_tokens":1000,"output_tokens":200,"type":"advisor_message","model":"claude-fable-5"}]}}}
+    ++ "\n";
+    parseJsonlContent(alloc, alloc, content, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+
+    const opus = pricing.findPricing("claude-opus-5").?;
+    const fable = pricing.findPricing("claude-fable-5").?;
+    const expected = pricing.calculateEntryCost(opus, .{ .input_tokens = 4, .output_tokens = 1198 }) +
+        pricing.calculateEntryCost(fable, .{ .input_tokens = 1000, .output_tokens = 200 });
+    try std.testing.expectApproxEqAbs(expected, entryCost(entries.items[0]), 1e-12);
+}
+
+test "diffScan replaces the placeholder with the advisor-inclusive final line" {
+    const projects = "/tmp/cc-test-advisor-projects";
+    const proj_dir = projects ++ "/proj";
+    const file_path = proj_dir ++ "/session.jsonl";
+    const cp = "/tmp/cc-test-advisor-cache.bin";
+
+    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
+    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
+    defer removeTmpFile(cp);
+
+    const placeholder =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":6}}}
+    ;
+    const final =
+        \\{"timestamp":"2025-06-15T10:00:05Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":751,"iterations":[{"input_tokens":100,"output_tokens":751,"type":"message"},{"input_tokens":90249,"output_tokens":15417,"type":"advisor_message","model":"claude-fable-5"}]}}}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+
+    try createTmpFile(file_path, placeholder ++ "\n");
+    _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+
+    try createTmpFile(file_path, placeholder ++ "\n" ++ final ++ "\n");
+    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
+        return error.TestUnexpectedResult;
+
+    const opus = pricing.findPricing("claude-opus-5").?;
+    const fable = pricing.findPricing("claude-fable-5").?;
+    const expected = pricing.calculateEntryCost(opus, .{ .input_tokens = 100, .output_tokens = 751 }) +
+        pricing.calculateEntryCost(fable, .{ .input_tokens = 90_249, .output_tokens = 15_417 });
+    try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
+}
+
+test "parseJsonlContent malformed iterations array drops the line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"iterations":[}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 0), entries.items.len);
+}
+
+test "parseJsonlContent iteration with null cache_creation keeps the aggregate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var seen = DedupSet.empty;
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+
+    const line =
+        \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"r1","message":{"id":"m1","model":"claude-opus-5","usage":{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":0},"iterations":[{"input_tokens":4,"output_tokens":10,"cache_creation_input_tokens":300,"cache_creation":null,"type":"message"},{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":500,"cache_creation":null,"type":"advisor_message","model":"claude-fable-5"}]}}}
+    ;
+    parseJsonlContent(alloc, alloc, line, &entries, &seen);
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+
+    // The advisor element's 500 aggregate cache-creation tokens are priced.
+    const fable = pricing.findPricing("claude-fable-5").?;
+    const expected = pricing.calculateEntryCost(fable, .{
+        .input_tokens = 1000,
+        .output_tokens = 200,
+        .cache_creation_5m_input_tokens = 500,
+    });
+    try std.testing.expectApproxEqAbs(expected, entries.items[0].advisor_cost, 1e-12);
+    // The message element's aggregate still reconciles, so the split holds.
+    try std.testing.expectEqual(@as(i64, 300), entries.items[0].usage.cache_creation_5m_input_tokens);
+    try std.testing.expectEqual(@as(i64, 0), entries.items[0].usage.cache_creation_1h_input_tokens);
 }
