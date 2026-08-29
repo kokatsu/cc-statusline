@@ -18,6 +18,7 @@ const getStr = ju.getStr;
 const getF64 = ju.getF64;
 const getI64 = ju.getI64;
 const getI64Field = ju.getI64Field;
+const getEpochMs = ju.getEpochMs;
 
 // ============================================================
 // Stdin Parsing
@@ -29,11 +30,8 @@ fn parseRateLimitWindow(obj: json.ObjectMap) ?RateLimitWindow {
     var window = RateLimitWindow{ .used_percentage = pct };
     if (obj.get("resets_at")) |ra| {
         // Claude Code sends resets_at as Unix epoch seconds (number)
-        if (getI64(ra)) |epoch_s| {
-            window.resets_at_ms = epoch_s * 1000;
-        } else if (getStr(ra)) |s| {
-            window.resets_at_ms = time.parseIso8601ToMs(s);
-        }
+        window.resets_at_ms = getEpochMs(ra) orelse
+            if (getStr(ra)) |s| time.parseIso8601ToMs(s) else null;
     }
     return window;
 }
@@ -55,10 +53,8 @@ fn parsePromptCache(obj: json.ObjectMap) PromptCache {
             if (mem.eql(u8, s, "5m")) pc.ttl = .five_min;
         }
     }
-    if (obj.get("expires_at")) |v| {
-        // Claude Code sends expires_at as Unix epoch seconds (number)
-        if (getI64(v)) |epoch_s| pc.expires_at_ms = epoch_s * 1000;
-    }
+    // Claude Code sends expires_at as Unix epoch seconds (number)
+    if (obj.get("expires_at")) |v| pc.expires_at_ms = getEpochMs(v);
     if (obj.get("hit_ratio")) |v| {
         if (getF64(v)) |ratio| pc.hit_percentage = ratio * 100.0;
     }
@@ -81,16 +77,17 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
         if (cost.get("total_cost_usd")) |usd| info.session_cost = getF64(usd);
         if (cost.get("total_lines_added")) |la| info.lines_added = getI64(la);
         if (cost.get("total_lines_removed")) |lr| info.lines_removed = getI64(lr);
-        if (cost.get("total_duration_ms")) |dur| {
-            if (getF64(dur)) |d| info.session_duration_ms = @as(i64, @intFromFloat(d));
-        }
+        // getI64 handles both .integer and .float, and range-checks the latter.
+        if (cost.get("total_duration_ms")) |dur| info.session_duration_ms = getI64(dur);
     }
     if (getObjField(root, "context_window")) |ctx| {
         if (ctx.get("used_percentage")) |pct| info.context_pct = getF64(pct);
         if (ctx.get("context_window_size")) |sz| info.context_window_size = getI64(sz);
         if (getObjField(ctx, "current_usage")) |usage| {
-            info.context_tokens = getI64Field(usage, "input_tokens") +
-                getI64Field(usage, "cache_creation_input_tokens") +
+            // Saturating: three i64 token counts can overflow a plain sum, and
+            // clamping costs no branch.
+            info.context_tokens = getI64Field(usage, "input_tokens") +|
+                getI64Field(usage, "cache_creation_input_tokens") +|
                 getI64Field(usage, "cache_read_input_tokens");
         } else if (ctx.get("total_input_tokens")) |t| {
             // Same input-only sum as current_usage per the statusline docs
@@ -402,6 +399,37 @@ test "parseStdin prompt_cache unknown ttl keeps other fields" {
     try std.testing.expectEqual(@as(?types.CacheTtl, null), pc.ttl);
     try std.testing.expect(pc.warm);
     try std.testing.expectApproxEqAbs(@as(f64, 50.0), pc.hit_percentage.?, 1e-10);
+}
+
+test "parseStdin rejects out-of-range numerics without trapping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Every value here traps on an unchecked conversion: 1e20 is a finite
+    // f64 outside i64, and 1e16 seconds overflows i64 when scaled to ms.
+    const input =
+        \\{"cost":{"total_duration_ms":1e20},"rate_limits":{"five_hour":{"used_percentage":42.0,"resets_at":1e20},"seven_day":{"used_percentage":10.0,"resets_at":10000000000000000}},"prompt_cache":{"caching_observed":true,"expires_at":1e20,"hit_ratio":0.5}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+
+    try std.testing.expectEqual(@as(?i64, null), info.session_duration_ms);
+
+    // The window survives; only the unusable reset time drops out.
+    try std.testing.expectApproxEqAbs(@as(f64, 42.0), info.rate_limit_5h.?.used_percentage, 1e-10);
+    try std.testing.expectEqual(@as(?i64, null), info.rate_limit_5h.?.resets_at_ms);
+    try std.testing.expectEqual(@as(?i64, null), info.rate_limit_7d.?.resets_at_ms);
+
+    try std.testing.expectEqual(@as(?i64, null), info.prompt_cache.?.expires_at_ms);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), info.prompt_cache.?.hit_percentage.?, 1e-10);
+}
+
+test "parseStdin saturates the current_usage token sum" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"context_window":{"current_usage":{"input_tokens":9223372036854775807,"cache_creation_input_tokens":9223372036854775807,"cache_read_input_tokens":9223372036854775807}}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(@as(?i64, std.math.maxInt(i64)), info.context_tokens);
 }
 
 test "parseStdin no prompt_cache" {

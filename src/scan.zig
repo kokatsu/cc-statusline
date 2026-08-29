@@ -447,7 +447,14 @@ const SaxScanner = struct {
     /// any parse failure rather than propagating an error: a wrong token
     /// count is preferable to silently dropping the entire transcript entry,
     /// and Anthropic transcripts never produce malformed numerics in practice.
-    fn readI64Slow(self: *SaxScanner) i64 {
+    /// `inline` is load-bearing, not cosmetic. The range check below pushed
+    /// this body over LLVM's inline threshold, so it was outlined and the
+    /// executing fast loop in `readI64` was re-optimized into materially worse
+    /// code (720 -> 392 bytes, different register allocation and branch
+    /// structure), costing ~6-10% on `read+parse` even though nothing here runs
+    /// for well-formed transcripts. Forcing the pre-existing inline decision
+    /// keeps the hot loop's codegen.
+    inline fn readI64Slow(self: *SaxScanner) i64 {
         const start = self.cursor;
         if (self.cursor < self.input.len and self.input[self.cursor] == '-')
             self.cursor += 1;
@@ -458,7 +465,12 @@ const SaxScanner = struct {
         }
         const slice = self.input[start..self.cursor];
         if (std.fmt.parseInt(i64, slice, 10)) |v| return v else |_| {}
-        if (std.fmt.parseFloat(f64, slice)) |f| return @intFromFloat(f) else |_| {}
+        if (std.fmt.parseFloat(f64, slice)) |f| {
+            // parseInt already rejected anything that fits i64, and "1e400"
+            // parses to inf here, so an unrepresentable value joins the 0
+            // default below like any other number we cannot use.
+            if (types.i64FromFloat(f)) |v| return v;
+        } else |_| {}
         return 0;
     }
 
@@ -2792,6 +2804,11 @@ test "SaxScanner readI64 slow path for negatives, floats, 19+ digits" {
         .{ .input = "{\"k\":1e3}", .want = 1000 },
         // 19-digit i64 max.
         .{ .input = "{\"k\":9223372036854775807}", .want = std.math.maxInt(i64) },
+        // Out of i64 range: parseInt rejects it and the float is unusable, so
+        // it joins the 0 default rather than trapping in @intFromFloat.
+        .{ .input = "{\"k\":1e20}", .want = 0 },
+        // parseFloat yields inf here, which is likewise out of range.
+        .{ .input = "{\"k\":1e400}", .want = 0 },
     };
     for (cases) |c| {
         var scanner = SaxScanner.init(c.input);

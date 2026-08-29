@@ -1,4 +1,22 @@
+const std = @import("std");
+
 pub const ms_per_min = 60_000;
+
+/// Checked f64 -> i64. Null when the value is outside i64 or is NaN.
+///
+/// `@intFromFloat` is illegal behavior in those cases, and both JSON parsers in
+/// this repo can be handed such a value by malformed input, so neither converts
+/// without going through here. They are independent parsers that do not import
+/// each other; one definition keeps the bound from drifting apart.
+///
+/// -2^63 is exactly representable as f64. 2^63 is the first value past
+/// maxInt(i64) — `@floatFromInt(maxInt(i64))` rounds *up* to it — so the upper
+/// bound is exclusive. NaN fails both comparisons, which is what we want.
+pub fn i64FromFloat(f: f64) ?i64 {
+    const min_f: f64 = @floatFromInt(std.math.minInt(i64));
+    if (f >= min_f and f < -min_f) return @intFromFloat(f);
+    return null;
+}
 
 pub const RateLimitWindow = struct {
     used_percentage: f64,
