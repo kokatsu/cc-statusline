@@ -12,6 +12,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown
+- **Prompt Cache** — Warm/cold state with a TTL-relative countdown (💾), cache hit ratio (🎯), and the dollar cost of re-caching if the prefix goes cold (💸), priced from the model's cache-write rate (opt-in via `CC_STATUSLINE_SHOW_CACHE=1`)
 - **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
 - **Pricing** — Supports Fable 5, Mythos 5, Opus 5/4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 5/4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
 - **Theming** — Built-in Catppuccin Mocha theme, fully customizable via environment variables
@@ -30,13 +31,18 @@ The binary is output to `zig-out/bin/cc-statusline`.
 
 ## Usage
 
-cc-statusline reads Claude Code's statusline JSON from stdin and outputs ANSI-colored status (2-3 lines depending on available data):
+cc-statusline reads Claude Code's statusline JSON from stdin and outputs ANSI-colored status (2-4 lines depending on available data):
 
 ```text
 🤖 Fable ⚡xhigh | 📛 my-session | 🌿 main | 🧠 ██████▓░░░ 63% 126k/200k
 💰 $26.79 today | 📊 $5.27 block 🔥 $11.33 /h
+💾 warm 41m | 🎯 █████████▓ 91% | 💸 $0.45
 🕔 5h ████▓░░░░░ 42% 1h 30m 05/08 01:00 | 📅 7d ░░░░░░░░░░ 4% 4d 11h 05/12 08:00
 ```
+
+[`schema.json`](./schema.json) is a sample of that stdin payload, recording the format defined by
+Claude Code's [status line reference](https://code.claude.com/docs/en/statusline). The field names
+and structure are the ones Claude Code sends; the values are this project's own.
 
 ### Claude Code Integration
 
@@ -84,7 +90,7 @@ Set `CC_STATUSLINE_BAR_WIDTH` to shrink the progress bars or hide them entirely:
 export CC_STATUSLINE_BAR_WIDTH=0
 ```
 
-The value caps the width derived from the terminal width (`COLUMNS`), so it can only shrink the bars — `0` hides both the context bar and the rate-limit bars.
+The value caps the width derived from the terminal width (`COLUMNS`), so it can only shrink the bars — `0` hides the context bar, the rate-limit bars, and the cache hit-ratio bar.
 
 ### Session Name
 
@@ -93,6 +99,23 @@ The session name segment (📛) is hidden by default. Set `CC_STATUSLINE_SHOW_SE
 ```sh
 export CC_STATUSLINE_SHOW_SESSION=1
 ```
+
+### Prompt Cache
+
+The prompt cache line (💾) is hidden by default. Set `CC_STATUSLINE_SHOW_CACHE=1` to show it:
+
+```sh
+export CC_STATUSLINE_SHOW_CACHE=1
+```
+
+It renders once Claude Code sends a `prompt_cache` object reporting `caching_observed: true`. The
+object needs Claude Code v2.1.251 or later and appears after the main conversation's first API
+response; `caching_observed` stays false while prompt caching is off or the provider doesn't report
+it, and the line stays hidden then. It is also dropped below 39 columns, where it no longer fits.
+
+The 💸 amount is what the next request would spend re-writing the cache if the prefix goes cold
+first — `recache_tokens_if_cold` at the model's cache-write rate for the active TTL. Like every
+other cost here it is a list-price estimate.
 
 ### Config Directory
 

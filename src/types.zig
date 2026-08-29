@@ -5,6 +5,36 @@ pub const RateLimitWindow = struct {
     resets_at_ms: ?i64 = null,
 };
 
+/// Lifetime of the cached prefix. Claude Code reports it as "5m" or "1h";
+/// anything else parses to null so the cost segment and the countdown color,
+/// which both depend on knowing the TTL, are skipped rather than guessed.
+pub const CacheTtl = enum {
+    five_min,
+    one_hour,
+
+    pub fn ms(self: CacheTtl) i64 {
+        return switch (self) {
+            .five_min => 5 * 60 * 1000,
+            .one_hour => 60 * 60 * 1000,
+        };
+    }
+};
+
+/// The subset of Claude Code's `prompt_cache` object that the cache line
+/// renders. The upstream object carries six more fields (requests, misses,
+/// expected_rebuilds, cache_write_tokens, miss_recache_tokens, last_miss_at)
+/// that nothing displays, so they are not kept.
+pub const PromptCache = struct {
+    warm: bool = false,
+    caching_observed: bool = false,
+    ttl: ?CacheTtl = null,
+    expires_at_ms: ?i64 = null,
+    /// `hit_ratio` (0..1 upstream) rescaled to 0..100 to match every other
+    /// percentage in this struct family.
+    hit_percentage: ?f64 = null,
+    recache_tokens_if_cold: ?i64 = null,
+};
+
 pub const BlockInfo = struct {
     start_ms: i64,
     end_ms: i64,
@@ -34,6 +64,7 @@ pub const StdinInfo = struct {
     cwd: ?[]const u8 = null,
     rate_limit_5h: ?RateLimitWindow = null,
     rate_limit_7d: ?RateLimitWindow = null,
+    prompt_cache: ?PromptCache = null,
     agent_name: ?[]const u8 = null,
     exceeds_200k_tokens: bool = false,
 };

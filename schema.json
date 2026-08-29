@@ -1,70 +1,84 @@
 {
-  "cwd": "/current/working/directory",
-  "session_id": "abc123...",
-  "session_name": "my-session",
-  "transcript_path": "/path/to/transcript.jsonl",
+  "cwd": "/home/user/projects/cc-statusline/src",
+  "session_id": "0b9f1c7e-4d52-4a86-9f31-2c8ad5e6b710",
+  "session_name": "prompt-cache-line",
+  "transcript_path": "/home/user/.claude/projects/-home-user-projects-cc-statusline/0b9f1c7e-4d52-4a86-9f31-2c8ad5e6b710.jsonl",
   "model": {
-    "id": "claude-opus-4-7",
+    "id": "claude-opus-5",
     "display_name": "Opus"
   },
   "workspace": {
-    "current_dir": "/current/working/directory",
-    "project_dir": "/original/project/directory",
+    "current_dir": "/home/user/projects/cc-statusline/src",
+    "project_dir": "/home/user/projects/cc-statusline",
     "added_dirs": [],
-    "git_worktree": "feature-xyz"
+    "git_worktree": "prompt-cache"
   },
-  "version": "2.1.90",
+  "version": "2.1.251",
   "output_style": {
     "name": "default"
   },
   "cost": {
-    "total_cost_usd": 0.01234,
-    "total_duration_ms": 45000,
-    "total_api_duration_ms": 2300,
-    "total_lines_added": 156,
-    "total_lines_removed": 23
+    "total_cost_usd": 4.8712,
+    "total_duration_ms": 3284000,
+    "total_api_duration_ms": 412000,
+    "total_lines_added": 518,
+    "total_lines_removed": 5
   },
   "context_window": {
-    "total_input_tokens": 15234,
-    "total_output_tokens": 4521,
-    "context_window_size": 200000,
-    "used_percentage": 8,
-    "remaining_percentage": 92,
+    "total_input_tokens": 461800,
+    "total_output_tokens": 3400,
+    "context_window_size": 1000000,
+    "used_percentage": 46.18,
+    "remaining_percentage": 53.82,
     "current_usage": {
-      "input_tokens": 8500,
-      "output_tokens": 1200,
-      "cache_creation_input_tokens": 5000,
-      "cache_read_input_tokens": 2000
+      "input_tokens": 12800,
+      "output_tokens": 3400,
+      "cache_creation_input_tokens": 61000,
+      "cache_read_input_tokens": 388000
     }
   },
-  "exceeds_200k_tokens": false,
+  "exceeds_200k_tokens": true,
+  "prompt_cache": {
+    "warm": true,
+    "caching_observed": true,
+    "ttl": "1h",
+    "expires_at": 1788007260,
+    "requests": 27,
+    "misses": 3,
+    "expected_rebuilds": 2,
+    "hit_ratio": 0.84,
+    "cache_write_tokens": 512000,
+    "miss_recache_tokens": 274000,
+    "last_miss_at": 1788003720,
+    "recache_tokens_if_cold": 449000
+  },
   "effort": {
-    "level": "high"
+    "level": "xhigh"
   },
   "thinking": {
     "enabled": true
   },
   "rate_limits": {
     "five_hour": {
-      "used_percentage": 23.5,
-      "resets_at": 1738425600
+      "used_percentage": 37.5,
+      "resets_at": 1788010200
     },
     "seven_day": {
-      "used_percentage": 41.2,
-      "resets_at": 1738857600
+      "used_percentage": 58.4,
+      "resets_at": 1788390000
     }
   },
   "vim": {
     "mode": "NORMAL"
   },
   "agent": {
-    "name": "security-reviewer"
+    "name": "code-reviewer"
   },
   "worktree": {
-    "name": "my-feature",
-    "path": "/path/to/.claude/worktrees/my-feature",
-    "branch": "worktree-my-feature",
-    "original_cwd": "/path/to/project",
+    "name": "prompt-cache",
+    "path": "/home/user/.claude/worktrees/prompt-cache",
+    "branch": "worktree-prompt-cache",
+    "original_cwd": "/home/user/projects/cc-statusline",
     "original_branch": "main"
   }
 }

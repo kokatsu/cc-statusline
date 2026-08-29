@@ -3,8 +3,10 @@ const mem = std.mem;
 const Writer = std.Io.Writer;
 const types = @import("types.zig");
 const time = @import("time.zig");
+const pricing = @import("pricing.zig");
 
 const RateLimitWindow = types.RateLimitWindow;
+const PromptCache = types.PromptCache;
 const BlockInfo = types.BlockInfo;
 const ScanResult = types.ScanResult;
 const StdinInfo = types.StdinInfo;
@@ -64,6 +66,9 @@ pub const Theme = struct {
     /// Render the session name segment on line 1. `initTheme` enables it only
     /// when `CC_STATUSLINE_SHOW_SESSION=1`.
     show_session: bool = true,
+    /// Render the prompt-cache line. `initTheme` enables it only when
+    /// `CC_STATUSLINE_SHOW_CACHE=1`.
+    show_cache: bool = true,
     /// Effort-level colors, mirroring Claude Code's `/effort` slider theme
     /// keys (low=warning, medium=success, high=permission, xhigh=autoAccept).
     /// Defaults are the built-in dark theme's values; unknown levels fall
@@ -284,6 +289,7 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
     theme.reset_info = layout.reset_info;
     theme.cols = parseColumns(env.get("COLUMNS"));
     theme.show_session = if (env.get("CC_STATUSLINE_SHOW_SESSION")) |v| mem.eql(u8, v, "1") else false;
+    theme.show_cache = if (env.get("CC_STATUSLINE_SHOW_CACHE")) |v| mem.eql(u8, v, "1") else false;
     return theme;
 }
 
@@ -332,6 +338,25 @@ pub fn rateLimitUsageColor(theme: Theme, used_pct: f64) []const u8 {
 pub fn rateLimitTimeColor(theme: Theme, remaining_ms: i64) []const u8 {
     if (remaining_ms < 30 * 60 * 1000) return theme.red;
     if (remaining_ms < 60 * 60 * 1000) return theme.yellow;
+    return theme.green;
+}
+
+/// Cache hit ratio: higher is better, so the thresholds run the opposite way
+/// from `contextColor` / `rateLimitUsageColor` and `thresholdColor` does not fit.
+pub fn cacheHitColor(theme: Theme, hit_pct: f64) []const u8 {
+    if (hit_pct >= 80.0) return theme.green;
+    if (hit_pct >= 50.0) return theme.yellow;
+    return theme.red;
+}
+
+/// Countdown color for the cached prefix. The thresholds are fractions of the
+/// TTL rather than absolute durations: a 5m cache is never "30 minutes from
+/// expiring", so `rateLimitTimeColor`'s fixed cutoffs would paint it red for
+/// its entire life.
+pub fn cacheTimeColor(theme: Theme, remaining_ms: i64, ttl_ms: i64) []const u8 {
+    const frac = @as(f64, @floatFromInt(remaining_ms)) / @as(f64, @floatFromInt(ttl_ms));
+    if (frac < 0.2) return theme.red;
+    if (frac < 0.5) return theme.yellow;
     return theme.green;
 }
 
@@ -472,6 +497,74 @@ pub fn parseBranchMax(val: ?[]const u8) usize {
 // ============================================================
 // Output
 // ============================================================
+
+/// Dollar cost of the cache write the next request makes if the cached prefix
+/// has gone cold by then. Rate selection is delegated to `calculateEntryCost`
+/// so `pricing.zig` stays the single source of truth for every cost we show.
+///
+/// Known limitation: `calculateEntryCost` picks the 200k tier from the sum of
+/// the buckets it is handed, which here is `recache_tokens_if_cold` alone. The
+/// real request also carries fresh uncached input, so a prefix just under 200k
+/// whose request crosses it is priced at the base rate. This only ever bites on
+/// `claude-sonnet-4-5` and `claude-sonnet-4`; every other model in the table
+/// leaves `input_above_200k` null, which makes the premium tier unreachable.
+fn recacheCost(model_id: ?[]const u8, pc: PromptCache) ?f64 {
+    const tokens = pc.recache_tokens_if_cold orelse return null;
+    const ttl = pc.ttl orelse return null;
+    const id = model_id orelse return null;
+    const p = pricing.findPricing(id) orelse return null;
+    const usage: pricing.TokenUsage = switch (ttl) {
+        .one_hour => .{ .cache_creation_1h_input_tokens = tokens },
+        .five_min => .{ .cache_creation_5m_input_tokens = tokens },
+    };
+    return pricing.calculateEntryCost(p, usage);
+}
+
+/// 💾 warm 1h 42m | 🎯 ████████▓░ 91% | 💸 $0.45
+///
+/// Each of the two trailing segments carries its own leading divider, so either
+/// can drop out without leaving a dangling or doubled separator. The warm/cold
+/// segment is unconditional once `printOutput` has admitted the line.
+fn writeCacheLine(w: *Writer, theme: Theme, pc: PromptCache, model_id: ?[]const u8, now_ms: i64) !void {
+    try w.writeAll("\xf0\x9f\x92\xbe "); // 💾
+    if (pc.warm) {
+        try w.print("{s}warm{s}", .{ theme.dim, theme.reset });
+        // Both are needed: the duration to render, the TTL to color it.
+        if (pc.expires_at_ms) |expires_ms| {
+            if (pc.ttl) |ttl| {
+                const remaining = expires_ms - now_ms;
+                var reset_buf: [64]u8 = undefined;
+                try w.print(" {s}{s}{s}", .{
+                    cacheTimeColor(theme, remaining, ttl.ms()),
+                    formatResetDuration(&reset_buf, remaining),
+                    theme.reset,
+                });
+            }
+        }
+    } else {
+        try w.print("{s}cold{s}", .{ theme.red, theme.reset });
+    }
+
+    if (pc.hit_percentage) |hit_pct| {
+        const hit_color = cacheHitColor(theme, hit_pct);
+        try w.print(" {s}|{s} \xf0\x9f\x8e\xaf ", .{ theme.dim, theme.reset }); // 🎯
+        if (theme.bar_width > 0) {
+            var bar_buf: [progress_bar_buf_size]u8 = undefined;
+            const bar = buildProgressBar(&bar_buf, hit_pct, theme.bar_width, theme.bar_filled, theme.bar_transition, theme.bar_empty);
+            try w.print("{s}{s}{s} ", .{ hit_color, bar, theme.reset });
+        }
+        try w.print("{s}{d:.0}%{s}", .{ hit_color, hit_pct, theme.reset });
+    }
+
+    if (recacheCost(model_id, pc)) |cost| {
+        var cost_buf: [32]u8 = undefined;
+        try w.print(" {s}|{s} \xf0\x9f\x92\xb8 {s}{s}{s}", .{ // 💸
+            theme.dim,    theme.reset,
+            theme.yellow, formatCurrency(&cost_buf, cost),
+            theme.reset,
+        });
+    }
+}
 
 fn writeRateLimitWindow(w: *Writer, theme: Theme, label: []const u8, rl: RateLimitWindow, now_ms: i64, utc_offset_s: i32) !void {
     const usage_color = rateLimitUsageColor(theme, rl.used_percentage);
@@ -830,7 +923,25 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
 
     try w.writeAll("\n");
 
-    // === Line 3: Rate Limits (5h + 7d) ===
+    // === Line 3: Prompt Cache ===
+    // Worst case is 39 + bar_width columns (💾 2 + " warm " 6 + duration 7 +
+    // " | " 3 + 🎯 2 + " " 1 + bar W + " 100%" 5 + " | " 3 + 💸 2 + " $999.99" 8).
+    // At every `layoutForColumns` tier that keeps the bar on, cols is at least 69
+    // while the line is at most 49, so it never sets the budget — the rate-limit
+    // line's 85 does. At the `.duration_only` tier the bar is already 0 and the
+    // line is at most 39, which still fits that tier's 39-column floor. Below it
+    // (`.none`, cols < 39) nothing fits, so the line is dropped rather than
+    // degraded further.
+    if (theme.show_cache and theme.reset_info != .none) {
+        if (stdin_info.prompt_cache) |pc| {
+            if (pc.caching_observed) {
+                try writeCacheLine(w, theme, pc, stdin_info.model_id, now_ms);
+                try w.writeAll("\n");
+            }
+        }
+    }
+
+    // === Line 4: Rate Limits (5h + 7d) ===
     const has_rate_limits = stdin_info.rate_limit_5h != null or stdin_info.rate_limit_7d != null;
     if (has_rate_limits) {
         // 🕔 5h ████████░░ 42% 2h 30m | 📅 7d ██████████ 86% 3d 12h
@@ -954,6 +1065,39 @@ test "rateLimitTimeColor thresholds" {
     try std.testing.expectEqualStrings(theme.yellow, rateLimitTimeColor(theme, 59 * 60 * 1000));
     try std.testing.expectEqualStrings(theme.green, rateLimitTimeColor(theme, 60 * 60 * 1000));
     try std.testing.expectEqualStrings(theme.green, rateLimitTimeColor(theme, 3 * 3600 * 1000));
+}
+
+// --- cacheHitColor ---
+
+test "cacheHitColor thresholds run opposite to usage colors" {
+    const theme = theme_default;
+    try std.testing.expectEqualStrings(theme.red, cacheHitColor(theme, 0.0));
+    try std.testing.expectEqualStrings(theme.red, cacheHitColor(theme, 49.9));
+    try std.testing.expectEqualStrings(theme.yellow, cacheHitColor(theme, 50.0));
+    try std.testing.expectEqualStrings(theme.yellow, cacheHitColor(theme, 79.9));
+    try std.testing.expectEqualStrings(theme.green, cacheHitColor(theme, 80.0));
+    try std.testing.expectEqualStrings(theme.green, cacheHitColor(theme, 100.0));
+}
+
+// --- cacheTimeColor ---
+
+test "cacheTimeColor thresholds are fractions of the TTL" {
+    const theme = theme_default;
+    const hour: i64 = 60 * 60 * 1000;
+    try std.testing.expectEqualStrings(theme.red, cacheTimeColor(theme, 0, hour));
+    try std.testing.expectEqualStrings(theme.red, cacheTimeColor(theme, 11 * 60 * 1000, hour));
+    try std.testing.expectEqualStrings(theme.yellow, cacheTimeColor(theme, 12 * 60 * 1000, hour));
+    try std.testing.expectEqualStrings(theme.yellow, cacheTimeColor(theme, 29 * 60 * 1000, hour));
+    try std.testing.expectEqualStrings(theme.green, cacheTimeColor(theme, 30 * 60 * 1000, hour));
+}
+
+test "cacheTimeColor scales to a 5m TTL" {
+    const theme = theme_default;
+    const five_min = types.CacheTtl.five_min.ms();
+    // 2m left in a 5m cache is 40% — yellow. `rateLimitTimeColor` would call it red.
+    try std.testing.expectEqualStrings(theme.yellow, cacheTimeColor(theme, 2 * 60 * 1000, five_min));
+    try std.testing.expectEqualStrings(theme.green, cacheTimeColor(theme, 3 * 60 * 1000, five_min));
+    try std.testing.expectEqualStrings(theme.red, cacheTimeColor(theme, 30 * 1000, five_min));
 }
 
 // --- buildProgressBar ---
@@ -1241,6 +1385,16 @@ test "initTheme hides session name unless CC_STATUSLINE_SHOW_SESSION=1" {
     try std.testing.expect(initTheme(&env).show_session);
 }
 
+test "initTheme hides the cache line unless CC_STATUSLINE_SHOW_CACHE=1" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expect(!initTheme(&env).show_cache);
+    try env.put("CC_STATUSLINE_SHOW_CACHE", "0");
+    try std.testing.expect(!initTheme(&env).show_cache);
+    try env.put("CC_STATUSLINE_SHOW_CACHE", "1");
+    try std.testing.expect(initTheme(&env).show_cache);
+}
+
 test "printOutput line1 no session name omits name badge emoji" {
     var aw: Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
@@ -1350,7 +1504,157 @@ test "printOutput line2 scan null" {
     try std.testing.expect(contains(aw.writer.buffered(), "N/A today"));
 }
 
-// --- printOutput: Line 3 ---
+// --- printOutput: Line 3 (prompt cache) ---
+
+const cache_emoji = "\xf0\x9f\x92\xbe"; // 💾
+const cache_hit_emoji = "\xf0\x9f\x8e\xaf"; // 🎯
+const cache_cost_emoji = "\xf0\x9f\x92\xb8"; // 💸
+
+/// A warm cache with every segment populated: 1h TTL with 42 minutes left,
+/// 91% hit ratio, and a re-cache that prices to $0.45 on Opus 5.
+fn warmCacheInfo() StdinInfo {
+    return .{
+        .model_id = "claude-opus-5",
+        .prompt_cache = .{
+            .warm = true,
+            .caching_observed = true,
+            .ttl = .one_hour,
+            .expires_at_ms = 42 * 60 * 1000,
+            .hit_percentage = 91.0,
+            .recache_tokens_if_cold = 45000,
+        },
+    };
+}
+
+test "printOutput cache line warm shows countdown, hit ratio and cost" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try printOutput(&aw.writer, theme_default, warmCacheInfo(), null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, cache_emoji));
+    try std.testing.expect(contains(out, "warm"));
+    try std.testing.expect(contains(out, "42m"));
+    try std.testing.expect(contains(out, cache_hit_emoji));
+    try std.testing.expect(contains(out, "91%"));
+    try std.testing.expect(contains(out, cache_cost_emoji));
+    try std.testing.expect(contains(out, "$0.45"));
+}
+
+test "printOutput cache line cold keeps hit ratio and cost" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.prompt_cache.?.warm = false;
+    info.prompt_cache.?.expires_at_ms = null;
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, theme_default.red ++ "cold"));
+    try std.testing.expect(!contains(out, "warm"));
+    try std.testing.expect(contains(out, "91%"));
+    try std.testing.expect(contains(out, "$0.45"));
+}
+
+test "printOutput cache line hidden unless show_cache" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    theme.show_cache = false;
+    try printOutput(&aw.writer, theme, warmCacheInfo(), null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(!contains(out, cache_emoji));
+    try std.testing.expectEqual(@as(usize, 2), countNewlines(out));
+}
+
+test "printOutput cache line hidden without caching_observed" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.prompt_cache.?.caching_observed = false;
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expect(!contains(aw.writer.buffered(), cache_emoji));
+}
+
+test "printOutput cache line hidden at the narrowest layout" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    theme.reset_info = .none;
+    try printOutput(&aw.writer, theme, warmCacheInfo(), null, 0, 0, null);
+    try std.testing.expect(!contains(aw.writer.buffered(), cache_emoji));
+}
+
+test "printOutput cache line drops the bar at bar_width 0" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    theme.bar_width = 0;
+    try printOutput(&aw.writer, theme, warmCacheInfo(), null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "91%"));
+    try std.testing.expect(!contains(out, theme.bar_filled));
+}
+
+test "printOutput cache line omits segments that have no data" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.prompt_cache.?.hit_percentage = null;
+    info.prompt_cache.?.recache_tokens_if_cold = null;
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, cache_emoji));
+    try std.testing.expect(!contains(out, cache_hit_emoji));
+    try std.testing.expect(!contains(out, cache_cost_emoji));
+    // No dangling divider after the warm segment.
+    try std.testing.expect(!contains(out, "warm" ++ theme_default.reset ++ " " ++ theme_default.dim ++ "|"));
+}
+
+test "printOutput cache line drops only the cost for an unknown model" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.model_id = "some-other-model";
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "91%"));
+    try std.testing.expect(!contains(out, cache_cost_emoji));
+}
+
+test "printOutput cache line drops the cost for an unknown ttl" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.prompt_cache.?.ttl = null;
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "warm"));
+    // No TTL means no countdown to color, and no rate to price the re-cache.
+    try std.testing.expect(!contains(out, "42m"));
+    try std.testing.expect(!contains(out, cache_cost_emoji));
+}
+
+test "printOutput cache line prices a 5m ttl at the 5m rate" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.prompt_cache.?.ttl = .five_min;
+    info.prompt_cache.?.expires_at_ms = 2 * 60 * 1000;
+    // Opus 5 cache_creation_5m = 6.25e-6 → 45000 * 6.25e-6 = $0.28125
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expect(contains(aw.writer.buffered(), "$0.28"));
+}
+
+test "printOutput cache line makes four lines with rate limits" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var info = warmCacheInfo();
+    info.rate_limit_5h = .{ .used_percentage = 42.0 };
+    info.rate_limit_7d = .{ .used_percentage = 86.0 };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    try std.testing.expectEqual(@as(usize, 4), countNewlines(aw.writer.buffered()));
+}
+
+// --- printOutput: Line 4 ---
 
 test "printOutput line3 5h rate limit" {
     var aw: Writer.Allocating = .init(std.testing.allocator);
@@ -1833,6 +2137,52 @@ test "rate-limit line fits within COLUMNS at every breakpoint" {
         var aw: Writer.Allocating = .init(std.testing.allocator);
         defer aw.deinit();
         const line = try renderWorstCaseRateLimit(&aw, cols);
+        try std.testing.expect(displayWidth(line) <= cols);
+    }
+}
+
+/// Render the worst-case prompt-cache output for `cols` and return the cache
+/// line, found by its 💾 marker rather than by position so the test cannot pass
+/// vacuously on an empty slice or on a neighbouring line. Caller owns the slice
+/// via `aw`.
+///
+/// Worst case: warm with a `max_reset_duration_cols` countdown ("23h 59m"), a
+/// 100% hit ratio, and a re-cache priced at "$999.99" — 99,999,000 tokens at
+/// Opus 5's 1h cache-write rate of 10e-6.
+fn renderWorstCaseCacheLine(aw: *Writer.Allocating, cols: u16) ![]const u8 {
+    const info = StdinInfo{
+        .model_id = "claude-opus-5",
+        .prompt_cache = .{
+            .warm = true,
+            .caching_observed = true,
+            .ttl = .one_hour,
+            .expires_at_ms = (23 * 3600 + 59 * 60) * 1000, // now=0 → "23h 59m"
+            .hit_percentage = 100.0,
+            .recache_tokens_if_cold = 99_999_000,
+        },
+    };
+    var theme = theme_default;
+    const layout = layoutForColumns(cols);
+    theme.bar_width = layout.bar_width;
+    theme.reset_info = layout.reset_info;
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
+    while (it.next()) |line| {
+        if (contains(line, cache_emoji)) return line;
+    }
+    return "";
+}
+
+test "cache line fits within COLUMNS at every breakpoint that renders it" {
+    // Tiers that render the line: bar shrinks (85..69), bar hidden full reset
+    // (68..63), duration only (62..39). At `.none` (38..23) the line is dropped
+    // entirely — covered by "printOutput cache line hidden at the narrowest layout".
+    const widths = [_]u16{ 200, 85, 84, 81, 80, 77, 76, 73, 72, 69, 68, 63, 62, 39 };
+    for (widths) |cols| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        const line = try renderWorstCaseCacheLine(&aw, cols);
+        try std.testing.expect(contains(line, cache_emoji));
         try std.testing.expect(displayWidth(line) <= cols);
     }
 }

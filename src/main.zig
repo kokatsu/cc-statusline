@@ -10,6 +10,7 @@ const ju = @import("json_util.zig");
 
 const StdinInfo = types.StdinInfo;
 const RateLimitWindow = types.RateLimitWindow;
+const PromptCache = types.PromptCache;
 
 const getObj = ju.getObj;
 const getObjField = ju.getObjField;
@@ -35,6 +36,35 @@ fn parseRateLimitWindow(obj: json.ObjectMap) ?RateLimitWindow {
         }
     }
     return window;
+}
+
+/// Unlike `parseRateLimitWindow`, there is no field whose absence makes the
+/// object meaningless, so this always builds a struct and lets each segment
+/// gate on its own data.
+fn parsePromptCache(obj: json.ObjectMap) PromptCache {
+    var pc = PromptCache{};
+    if (obj.get("warm")) |v| {
+        if (v == .bool) pc.warm = v.bool;
+    }
+    if (obj.get("caching_observed")) |v| {
+        if (v == .bool) pc.caching_observed = v.bool;
+    }
+    if (obj.get("ttl")) |v| {
+        if (getStr(v)) |s| {
+            if (mem.eql(u8, s, "1h")) pc.ttl = .one_hour;
+            if (mem.eql(u8, s, "5m")) pc.ttl = .five_min;
+        }
+    }
+    if (obj.get("expires_at")) |v| {
+        // Claude Code sends expires_at as Unix epoch seconds (number)
+        if (getI64(v)) |epoch_s| pc.expires_at_ms = epoch_s * 1000;
+    }
+    if (obj.get("hit_ratio")) |v| {
+        if (getF64(v)) |ratio| pc.hit_percentage = ratio * 100.0;
+    }
+    // getI64, not getI64Field: absent and 0 must stay distinguishable.
+    if (obj.get("recache_tokens_if_cold")) |v| pc.recache_tokens_if_cold = getI64(v);
+    return pc;
 }
 
 fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
@@ -77,6 +107,9 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
         if (getObjField(rl, "five_hour")) |fh| info.rate_limit_5h = parseRateLimitWindow(fh);
         if (getObjField(rl, "seven_day")) |sd| info.rate_limit_7d = parseRateLimitWindow(sd);
     }
+
+    // Parse prompt_cache (added in Claude Code v2.1.251)
+    if (getObjField(root, "prompt_cache")) |pc| info.prompt_cache = parsePromptCache(pc);
 
     if (getObjField(root, "agent")) |agent| {
         if (agent.get("name")) |n| info.agent_name = getStr(n);
@@ -311,6 +344,74 @@ test "parseStdin no rate_limits" {
     const info = parseStdin(arena.allocator(), input);
     try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_5h);
     try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_7d);
+}
+
+test "parseStdin prompt_cache full" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"prompt_cache":{"warm":true,"caching_observed":true,"ttl":"1h","expires_at":1738429200,"requests":14,"misses":2,"hit_ratio":0.91,"recache_tokens_if_cold":45000}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+
+    try std.testing.expect(info.prompt_cache != null);
+    const pc = info.prompt_cache.?;
+    try std.testing.expect(pc.warm);
+    try std.testing.expect(pc.caching_observed);
+    try std.testing.expectEqual(types.CacheTtl.one_hour, pc.ttl.?);
+    try std.testing.expectEqual(@as(i64, 1738429200 * 1000), pc.expires_at_ms.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 91.0), pc.hit_percentage.?, 1e-10);
+    try std.testing.expectEqual(@as(i64, 45000), pc.recache_tokens_if_cold.?);
+}
+
+test "parseStdin prompt_cache 5m ttl" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"prompt_cache":{"caching_observed":true,"ttl":"5m"}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(types.CacheTtl.five_min, info.prompt_cache.?.ttl.?);
+}
+
+test "parseStdin prompt_cache cold with nulls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"prompt_cache":{"warm":false,"caching_observed":true,"ttl":"1h","expires_at":null,"hit_ratio":null,"recache_tokens_if_cold":null}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+
+    const pc = info.prompt_cache.?;
+    try std.testing.expect(!pc.warm);
+    try std.testing.expect(pc.caching_observed);
+    try std.testing.expectEqual(@as(?i64, null), pc.expires_at_ms);
+    try std.testing.expectEqual(@as(?f64, null), pc.hit_percentage);
+    try std.testing.expectEqual(@as(?i64, null), pc.recache_tokens_if_cold);
+}
+
+test "parseStdin prompt_cache unknown ttl keeps other fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"prompt_cache":{"warm":true,"caching_observed":true,"ttl":"10m","hit_ratio":0.5}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+
+    const pc = info.prompt_cache.?;
+    try std.testing.expectEqual(@as(?types.CacheTtl, null), pc.ttl);
+    try std.testing.expect(pc.warm);
+    try std.testing.expectApproxEqAbs(@as(f64, 50.0), pc.hit_percentage.?, 1e-10);
+}
+
+test "parseStdin no prompt_cache" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"model":{"id":"claude-opus-5","display_name":"Opus"}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(@as(?PromptCache, null), info.prompt_cache);
 }
 
 test "parseStdin cost and line fields" {
