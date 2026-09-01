@@ -40,6 +40,12 @@ pub const ModelPricing = struct {
 };
 
 pub const pricing_table = [_]ModelPricing{
+    // Fable 5.1 (1M context at standard pricing; same rates as Fable 5 except
+    // cache reads at 0.025x base input instead of 0.1x). Must precede
+    // "claude-fable-5", which would otherwise prefix-match it.
+    .{ .prefix = "claude-fable-5-1", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 2.5e-7 },
+    // Mythos 5.1 (limited availability; same rates as Fable 5.1)
+    .{ .prefix = "claude-mythos-5-1", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 2.5e-7 },
     // Fable 5 (1M context at standard pricing)
     .{ .prefix = "claude-fable-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
     // Mythos 5 (limited availability; same rates as Fable 5)
@@ -238,6 +244,45 @@ test "calculateEntryCost opus 4.8 fast mode uses explicit fast rates" {
     const cost = calculateEntryCost(p, usage);
     // 1000 * 1e-5 (fast.input) + 500 * 5e-5 (fast.output) = 0.01 + 0.025 = 0.035
     try std.testing.expectApproxEqAbs(@as(f64, 0.035), cost, 1e-10);
+}
+
+test "calculateEntryCost fable 5.1 all five rates" {
+    const p = findPricing("claude-fable-5-1[1m]").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 1000*10e-6 + 500*50e-6 + 2000*12.5e-6 + 3000*20e-6 + 4000*2.5e-7
+    // = 0.01 + 0.025 + 0.025 + 0.06 + 0.001 = 0.121
+    try std.testing.expectApproxEqAbs(@as(f64, 0.121), cost, 1e-10);
+}
+
+test "calculateEntryCost fable 5.1 over 200k uses base rate and has no fast tier" {
+    const p = findPricing("claude-fable-5-1").?;
+    try std.testing.expectEqual(@as(?f64, null), p.input_above_200k);
+    try std.testing.expectEqual(@as(?FastRates, null), p.fast);
+    const usage = TokenUsage{
+        .input_tokens = 300_000,
+        .output_tokens = 1000,
+        .is_fast = true,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // base rate: 300_000 * 10e-6 + 1000 * 50e-6 = 3.0 + 0.05 = 3.05
+    try std.testing.expectApproxEqAbs(@as(f64, 3.05), cost, 1e-10);
+}
+
+test "calculateEntryCost mythos 5.1 matches fable 5.1 rates" {
+    const fable = findPricing("claude-fable-5-1").?;
+    const mythos = findPricing("claude-mythos-5-1").?;
+    try std.testing.expectEqual(fable.input, mythos.input);
+    try std.testing.expectEqual(fable.output, mythos.output);
+    try std.testing.expectEqual(fable.cache_creation_5m, mythos.cache_creation_5m);
+    try std.testing.expectEqual(fable.cache_creation_1h, mythos.cache_creation_1h);
+    try std.testing.expectEqual(fable.cache_read, mythos.cache_read);
 }
 
 test "calculateEntryCost fable 5 all five rates" {
@@ -530,6 +575,9 @@ test "calculateEntryCost sonnet 4.5 above 200k uses 1h premium rate" {
 
 test "findPricing all model prefixes" {
     const expected = [_]struct { model: []const u8, prefix: []const u8 }{
+        .{ .model = "claude-fable-5-1", .prefix = "claude-fable-5-1" },
+        .{ .model = "claude-fable-5-1[1m]", .prefix = "claude-fable-5-1" },
+        .{ .model = "claude-mythos-5-1[1m]", .prefix = "claude-mythos-5-1" },
         .{ .model = "claude-fable-5-20260601", .prefix = "claude-fable-5" },
         .{ .model = "claude-fable-5[1m]", .prefix = "claude-fable-5" },
         .{ .model = "claude-mythos-5[1m]", .prefix = "claude-mythos-5" },
@@ -574,6 +622,18 @@ test "findPricing prefix ordering specific sonnet-4 variants before generic sonn
 test "findPricing sonnet-5 and sonnet-4 do not collide" {
     try std.testing.expectEqualStrings("claude-sonnet-5", findPricing("claude-sonnet-5-20260615").?.prefix);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", findPricing("claude-sonnet-4-6-20251212").?.prefix);
+}
+
+test "findPricing fable-5-1 and fable-5 do not collide" {
+    // "claude-fable-5" is a prefix of "claude-fable-5-1"; the 5.1 entries must
+    // come first in the table or 5.1 cache reads get billed at the Fable 5 rate.
+    try std.testing.expectEqualStrings("claude-fable-5-1", findPricing("claude-fable-5-1").?.prefix);
+    try std.testing.expectEqualStrings("claude-fable-5-1", findPricing("claude-fable-5-1[1m]").?.prefix);
+    try std.testing.expectEqualStrings("claude-fable-5", findPricing("claude-fable-5").?.prefix);
+    try std.testing.expectEqualStrings("claude-fable-5", findPricing("claude-fable-5-20260601").?.prefix);
+    try std.testing.expectEqualStrings("claude-mythos-5-1", findPricing("claude-mythos-5-1").?.prefix);
+    try std.testing.expectEqualStrings("claude-mythos-5", findPricing("claude-mythos-5[1m]").?.prefix);
+    try std.testing.expect(findPricing("claude-fable-5-1").?.cache_read != findPricing("claude-fable-5").?.cache_read);
 }
 
 test "findPricing opus-5 and opus-4 do not collide" {

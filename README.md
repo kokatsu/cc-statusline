@@ -14,7 +14,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown
 - **Prompt Cache** — Warm/cold state with a TTL-relative countdown (💾), cache hit ratio (🎯), and the dollar cost of re-caching if the prefix goes cold (💸), priced from the model's cache-write rate (opt-in via `CC_STATUSLINE_SHOW_CACHE=1`)
 - **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
-- **Pricing** — Supports Fable 5, Mythos 5, Opus 5/4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 5/4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
+- **Pricing** — Supports Fable 5.1/5, Mythos 5.1/5, Opus 5/4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 5/4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
 - **Theming** — Built-in Catppuccin Mocha theme, fully customizable via environment variables
 
 ## Requirements
