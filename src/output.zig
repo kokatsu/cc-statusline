@@ -69,6 +69,9 @@ pub const Theme = struct {
     /// Render the prompt-cache line. `initTheme` enables it only when
     /// `CC_STATUSLINE_SHOW_CACHE=1`.
     show_cache: bool = true,
+    /// Render the cost line. Opt-out: `initTheme` disables it only when
+    /// `CC_STATUSLINE_SHOW_COST=0`. Ignored when stdin is absent (see `printOutput`).
+    show_cost: bool = true,
     /// Effort-level colors, mirroring Claude Code's `/effort` slider theme
     /// keys (low=warning, medium=success, high=permission, xhigh=autoAccept).
     /// Defaults are the built-in dark theme's values; unknown levels fall
@@ -290,6 +293,8 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
     theme.cols = parseColumns(env.get("COLUMNS"));
     theme.show_session = if (env.get("CC_STATUSLINE_SHOW_SESSION")) |v| mem.eql(u8, v, "1") else false;
     theme.show_cache = if (env.get("CC_STATUSLINE_SHOW_CACHE")) |v| mem.eql(u8, v, "1") else false;
+    // Opt-out, unlike the SHOW_* flags above: the cost line is on unless "0".
+    theme.show_cost = if (env.get("CC_STATUSLINE_SHOW_COST")) |v| !mem.eql(u8, v, "0") else true;
     return theme;
 }
 
@@ -897,31 +902,37 @@ fn planLine1(theme: Theme, stdin_info: StdinInfo, git_branch: ?[]const u8) Line1
 
 pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanResult, now_ms: i64, utc_offset_s: i32, git_branch: ?[]const u8) !void {
     // === Line 1: Model + Effort + Agent + Session + Branch + Context ===
-    const plan = planLine1(theme, stdin_info, git_branch);
-    try writeLine1(w, theme, stdin_info, git_branch, plan);
-    try w.writeAll("\n");
-
-    // === Line 2: Cost + Block ===
-    if (scan) |s| {
-        var today_buf: [32]u8 = undefined;
-        try w.print("\xf0\x9f\x92\xb0 {s}{s}{s} today", .{ theme.yellow, formatCurrency(&today_buf, s.today_cost), theme.reset });
-        if (s.block) |block| {
-            var block_buf: [32]u8 = undefined;
-            try w.print(" {s}|{s} \xf0\x9f\x93\x8a {s}{s}{s} block", .{
-                theme.dim,
-                theme.reset,
-                theme.yellow,
-                formatCurrency(&block_buf, block.cost),
-                theme.reset,
-            });
-            var rate_buf: [32]u8 = undefined;
-            try w.print(" \xf0\x9f\x94\xa5 {s}{s}{s} {s}/h{s}", .{ theme.yellow, formatCurrency(&rate_buf, block.burn_rate_per_hr), theme.reset, theme.dim, theme.reset });
-        }
-    } else {
-        try w.writeAll("\xf0\x9f\x92\xb0 N/A today");
+    // With no session JSON on stdin the line is a fixed "Unknown | N/A", so skip it.
+    if (!stdin_info.stdin_absent) {
+        const plan = planLine1(theme, stdin_info, git_branch);
+        try writeLine1(w, theme, stdin_info, git_branch, plan);
+        try w.writeAll("\n");
     }
 
-    try w.writeAll("\n");
+    // === Line 2: Cost + Block ===
+    // Always emitted when stdin is absent: external status bars may read
+    // only the last line and rely on it being the cost line.
+    if (theme.show_cost or stdin_info.stdin_absent) {
+        if (scan) |s| {
+            var today_buf: [32]u8 = undefined;
+            try w.print("\xf0\x9f\x92\xb0 {s}{s}{s} today", .{ theme.yellow, formatCurrency(&today_buf, s.today_cost), theme.reset });
+            if (s.block) |block| {
+                var block_buf: [32]u8 = undefined;
+                try w.print(" {s}|{s} \xf0\x9f\x93\x8a {s}{s}{s} block", .{
+                    theme.dim,
+                    theme.reset,
+                    theme.yellow,
+                    formatCurrency(&block_buf, block.cost),
+                    theme.reset,
+                });
+                var rate_buf: [32]u8 = undefined;
+                try w.print(" \xf0\x9f\x94\xa5 {s}{s}{s} {s}/h{s}", .{ theme.yellow, formatCurrency(&rate_buf, block.burn_rate_per_hr), theme.reset, theme.dim, theme.reset });
+            }
+        } else {
+            try w.writeAll("\xf0\x9f\x92\xb0 N/A today");
+        }
+        try w.writeAll("\n");
+    }
 
     // === Line 3: Prompt Cache ===
     // Worst case is 39 + bar_width columns (💾 2 + " warm " 6 + duration 7 +
@@ -1395,6 +1406,16 @@ test "initTheme hides the cache line unless CC_STATUSLINE_SHOW_CACHE=1" {
     try std.testing.expect(initTheme(&env).show_cache);
 }
 
+test "initTheme shows the cost line unless CC_STATUSLINE_SHOW_COST=0" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expect(initTheme(&env).show_cost);
+    try env.put("CC_STATUSLINE_SHOW_COST", "1");
+    try std.testing.expect(initTheme(&env).show_cost);
+    try env.put("CC_STATUSLINE_SHOW_COST", "0");
+    try std.testing.expect(!initTheme(&env).show_cost);
+}
+
 test "printOutput line1 no session name omits name badge emoji" {
     var aw: Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
@@ -1502,6 +1523,56 @@ test "printOutput line2 scan null" {
     defer aw.deinit();
     try printOutput(&aw.writer, theme_default, StdinInfo{}, null, 0, 0, null);
     try std.testing.expect(contains(aw.writer.buffered(), "N/A today"));
+}
+
+test "printOutput stdin absent emits only the cost line" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const scan = ScanResult{ .today_cost = 1.50 };
+    try printOutput(&aw.writer, theme_default, StdinInfo{ .stdin_absent = true }, scan, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(!contains(out, "Unknown"));
+    try std.testing.expect(contains(out, "$1.50"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+}
+
+test "printOutput stdin absent with scan null still emits N/A today" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try printOutput(&aw.writer, theme_default, StdinInfo{ .stdin_absent = true }, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "N/A today"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+}
+
+test "printOutput show_cost=false drops the cost line but keeps the others" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    theme.show_cost = false;
+    const info = StdinInfo{
+        .model_name = "Fable",
+        .rate_limit_5h = .{ .used_percentage = 10.0, .resets_at_ms = 3600 * 1000 },
+    };
+    const scan = ScanResult{ .today_cost = 1.50 };
+    try printOutput(&aw.writer, theme, info, scan, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "Fable"));
+    try std.testing.expect(!contains(out, "$1.50"));
+    try std.testing.expect(!contains(out, "today"));
+    try std.testing.expect(contains(out, "5h"));
+}
+
+test "printOutput show_cost=false is ignored when stdin is absent" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    var theme = theme_default;
+    theme.show_cost = false;
+    const scan = ScanResult{ .today_cost = 1.50 };
+    try printOutput(&aw.writer, theme, StdinInfo{ .stdin_absent = true }, scan, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "$1.50"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
 }
 
 // --- printOutput: Line 3 (prompt cache) ---

@@ -85,4 +85,7 @@ pub const StdinInfo = struct {
     prompt_cache: ?PromptCache = null,
     agent_name: ?[]const u8 = null,
     exceeds_200k_tokens: bool = false,
+    /// True only when standard input was empty (0 bytes). Defaults to false so
+    /// a bare `StdinInfo{}` still means "a session JSON was present".
+    stdin_absent: bool = false,
 };

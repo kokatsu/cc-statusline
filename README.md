@@ -10,7 +10,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Session Name** — Shows custom session name (📛) set via `--name` or `/rename` (opt-in via `CC_STATUSLINE_SHOW_SESSION=1`)
 - **Subagent Indicator** — Shows current subagent name (🧩) when running inside a Claude Code subagent
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
-- **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour
+- **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour (opt-out via `CC_STATUSLINE_SHOW_COST=0`)
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown
 - **Prompt Cache** — Warm/cold state with a TTL-relative countdown (💾), cache hit ratio (🎯), and the dollar cost of re-caching if the prefix goes cold (💸), priced from the model's cache-write rate (opt-in via `CC_STATUSLINE_SHOW_CACHE=1`)
 - **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
@@ -116,6 +116,34 @@ it, and the line stays hidden then. It is also dropped below 39 columns, where i
 The 💸 amount is what the next request would spend re-writing the cache if the prefix goes cold
 first — `recache_tokens_if_cold` at the model's cache-write rate for the active TTL. Like every
 other cost here it is a list-price estimate.
+
+### Cost Line
+
+The cost line (💰) is shown by default. Set `CC_STATUSLINE_SHOW_COST=0` to hide it, for example
+when another widget already shows the same number:
+
+```sh
+export CC_STATUSLINE_SHOW_COST=0
+```
+
+Hiding the line does not skip the transcript scan. The scan runs on every invocation so the shared
+cache keeps a `block` computed from Claude Code's real 5-hour reset window, which only a call with a
+session JSON on stdin can supply.
+
+### Standalone Use (Empty Stdin)
+
+When nothing is piped to stdin, cc-statusline emits exactly one line: the cost line. The model and
+context line is dropped because it would only ever read `Unknown | N/A`, and `CC_STATUSLINE_SHOW_COST`
+is ignored so the output is never empty. This is the contract for status bars that run the binary
+themselves, such as a tmux status-bar command:
+
+```sh
+cc-statusline </dev/null
+# 💰 $2.16 today | 📊 $2.16 block 🔥 $12.36 /h
+```
+
+Malformed JSON on stdin still produces both lines, so a broken pipeline is visible as `Unknown`. A
+failed stdin read is treated as empty input.
 
 ### Config Directory
 

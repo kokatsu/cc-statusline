@@ -65,7 +65,10 @@ fn parsePromptCache(obj: json.ObjectMap) PromptCache {
 
 fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
     var info = StdinInfo{};
-    if (data.len == 0) return info;
+    if (data.len == 0) {
+        info.stdin_absent = true;
+        return info;
+    }
     const parsed = json.parseFromSlice(json.Value, allocator, data, .{}) catch return info;
     const root = getObj(parsed.value) orelse return info;
 
@@ -593,10 +596,17 @@ test "parseGitHead no trailing newline" {
     try std.testing.expectEqualStrings("abc1234", parseGitHead("abc1234def5678901234567890abcdef01234567").?);
 }
 
+test "parseStdin empty input sets stdin_absent" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expect(parseStdin(arena.allocator(), "").stdin_absent);
+}
+
 test "parseStdin invalid json" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const info = parseStdin(arena.allocator(), "{broken");
+    try std.testing.expect(!info.stdin_absent);
     try std.testing.expectEqual(@as(?[]const u8, null), info.model_id);
     try std.testing.expectEqual(@as(?f64, null), info.session_cost);
     try std.testing.expectEqual(@as(?f64, null), info.context_pct);
