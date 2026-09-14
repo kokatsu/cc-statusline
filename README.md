@@ -11,7 +11,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Subagent Indicator** — Shows current subagent name (🧩) when running inside a Claude Code subagent
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour (opt-out via `CC_STATUSLINE_SHOW_COST=0`)
-- **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown
+- **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown, plus the spend limit (💳) behind a Claude apps gateway
 - **Prompt Cache** — Warm/cold state with a TTL-relative countdown (💾), cache hit ratio (🎯), and the dollar cost of re-caching if the prefix goes cold (💸), priced from the model's cache-write rate (opt-in via `CC_STATUSLINE_SHOW_CACHE=1`)
 - **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
 - **Pricing** — Supports Fable 5.1/5, Mythos 5.1/5, Opus 5/4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 5/4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
@@ -39,6 +39,10 @@ cc-statusline reads Claude Code's statusline JSON from stdin and outputs ANSI-co
 💾 warm 41m | 🎯 █████████▓ 91% | 💸 $0.45
 🕔 5h ████▓░░░░░ 42% 1h 30m 05/08 01:00 | 📅 7d ░░░░░░░░░░ 4% 4d 11h 05/12 08:00
 ```
+
+The rate-limit line appears for Claude.ai Pro and Max subscribers. Behind a Claude apps gateway
+with a spend limit, a third window (💳 `$`) shows that limit's usage; its percentage can exceed
+100 once the limit is passed. Each window is dropped by Claude Code once its reset time passes.
 
 [`schema.json`](./schema.json) is a sample of that stdin payload, recording the format defined by
 Claude Code's [status line reference](https://code.claude.com/docs/en/statusline). The field names

@@ -219,31 +219,39 @@ pub const Layout = struct {
     reset_info: ResetInfo,
 };
 
-/// Map a terminal column count to a rate-limit-line layout via fixed breakpoints.
+/// Rate-limit-line layout for `windows` windows whose labels add up to
+/// `label_cols` columns, chosen so the worst case never wraps at `cols`.
 ///
-/// The 5h/7d rate-limit line is the widest fully-controlled line we render.
-/// Each window is `label(2) + bar(W) + "100%"(4) + duration(max
-/// `max_reset_duration_cols`=7, e.g. "23h 59m") + "MM/DD HH:MM"(11)` with
-/// single-space gaps; there are two of them plus the leading 🕔/📅 emoji and
-/// the " | " divider. Worst-case widths:
+/// Each window renders `label bar 100% duration datetime` with single-space
+/// gaps, where duration is at most `max_reset_duration_cols` (7, "23h 59m")
+/// and datetime is "MM/DD HH:MM" (11): `label + 25` columns, plus `W + 1`
+/// when the bar is shown. Around them sit one leading emoji and space per
+/// window (3) and a " | " divider between windows (3). For the two
+/// subscription windows (labels "5h" and "7d", 4 columns) the worst cases are:
 ///
 ///     bar present:   65 + 2 * bar_width   (line = 69..85 for W ∈ {2..10})
 ///     bar hidden:    63                   (drops `bar+sp` per window → -2)
 ///     duration only: 39                   (drops ` MM/DD HH:MM` per window → -24)
 ///     none:          23                   (drops ` 23h 59m` per window → -16)
 ///
-/// Each threshold is the smallest COLUMNS at which the corresponding worst-case
-/// width still fits, so the line never wraps. Below ~23 columns there is nothing
+/// Bar widths shrink in steps of two until the line fits; once the bar is
+/// gone the datetime goes, then the duration. Below that there is nothing
 /// left to drop short of splitting into multiple lines, so the floor stops there.
+pub fn layoutForWindows(cols: u16, windows: u16, label_cols: u16) Layout {
+    const fixed_full: u16 = label_cols + 25 * windows + 3 * windows + 3 * (windows - 1);
+    var w: u16 = default_bar_width;
+    while (w >= 2) : (w -= 2) {
+        if (cols >= fixed_full + (w + 1) * windows) return .{ .bar_width = @intCast(w), .reset_info = .full };
+    }
+    if (cols >= fixed_full) return .{ .bar_width = 0, .reset_info = .full };
+    if (cols >= fixed_full - 12 * windows) return .{ .bar_width = 0, .reset_info = .duration_only };
+    return .{ .bar_width = 0, .reset_info = .none };
+}
+
+/// `layoutForWindows` for the two subscription windows ("5h", "7d"), the
+/// line `initTheme` budgets for.
 pub fn layoutForColumns(cols: u16) Layout {
-    if (cols >= 85) return .{ .bar_width = 10, .reset_info = .full }; // 65 + 20
-    if (cols >= 81) return .{ .bar_width = 8, .reset_info = .full }; // 65 + 16
-    if (cols >= 77) return .{ .bar_width = 6, .reset_info = .full }; // 65 + 12
-    if (cols >= 73) return .{ .bar_width = 4, .reset_info = .full }; // 65 + 8
-    if (cols >= 69) return .{ .bar_width = 2, .reset_info = .full }; // 65 + 4
-    if (cols >= 63) return .{ .bar_width = 0, .reset_info = .full }; // 63
-    if (cols >= 39) return .{ .bar_width = 0, .reset_info = .duration_only }; // 39
-    return .{ .bar_width = 0, .reset_info = .none }; // 23
+    return layoutForWindows(cols, 2, 4);
 }
 
 /// Parse the `COLUMNS` value. Absent or unparseable (older Claude Code, or a
@@ -603,6 +611,23 @@ fn writeRateLimitWindow(w: *Writer, theme: Theme, label: []const u8, rl: RateLim
     }
 }
 
+/// Columns a rendered percentage takes beyond the four of "100%", which is
+/// what `layoutForWindows` budgets per window. Zero for 0..100; the spend
+/// limit has no upper bound, so 1000% and up cost extra.
+fn pctExtraCols(pct: f64) u16 {
+    var buf: [32]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&buf, "{d:.0}%", .{pct}) catch return 0;
+    return @intCast(rendered.len -| 4);
+}
+
+/// One window of the rate-limit line; `window` is null when Claude Code
+/// did not send it.
+const RateLimitSlot = struct {
+    emoji: []const u8,
+    label: []const u8,
+    window: ?RateLimitWindow,
+};
+
 /// Line-1 rendering decisions produced by `planLine1`. Fields start at their
 /// richest setting and are degraded until the rendered line fits `COLUMNS`.
 const Line1Plan = struct {
@@ -952,25 +977,42 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
         }
     }
 
-    // === Line 4: Rate Limits (5h + 7d) ===
-    const has_rate_limits = stdin_info.rate_limit_5h != null or stdin_info.rate_limit_7d != null;
-    if (has_rate_limits) {
-        // 🕔 5h ████████░░ 42% 2h 30m | 📅 7d ██████████ 86% 3d 12h
-        try w.print("\xf0\x9f\x95\x94 ", .{}); // 🕔
-
-        if (stdin_info.rate_limit_5h) |rl5| {
-            try writeRateLimitWindow(w, theme, "5h", rl5, now_ms, utc_offset_s);
+    // === Line 4: Rate Limits (5h + 7d + spend) ===
+    // 🕔 5h ████████░░ 42% 2h 30m | 📅 7d ██████████ 86% 3d 12h | 💳 $ ███░░░░░░░ 12%
+    const slots = [_]RateLimitSlot{
+        .{ .emoji = "\xf0\x9f\x95\x94", .label = "5h", .window = stdin_info.rate_limit_5h }, // 🕔
+        .{ .emoji = "\xf0\x9f\x93\x85", .label = "7d", .window = stdin_info.rate_limit_7d }, // 📅
+        .{ .emoji = "\xf0\x9f\x92\xb3", .label = "$", .window = stdin_info.rate_limit_spend }, // 💳
+    };
+    var present: u16 = 0;
+    var label_cols: u16 = 0;
+    for (slots) |slot| {
+        if (slot.window) |rl| {
+            present += 1;
+            label_cols += @as(u16, @intCast(slot.label.len)) + pctExtraCols(rl.used_percentage);
         }
-
-        if (stdin_info.rate_limit_5h != null and stdin_info.rate_limit_7d != null) {
-            try w.print(" {s}|{s} ", .{ theme.dim, theme.reset });
+    }
+    if (present > 0) {
+        // `theme` was budgeted for the two subscription windows with four
+        // label columns; a third window, or a spend percentage wider than
+        // "100%", needs its own, narrower layout. The bar can only shrink so
+        // `CC_STATUSLINE_BAR_WIDTH` keeps its cap.
+        var rl_theme = theme;
+        if (present > 2 or label_cols > 4) {
+            if (theme.cols) |cols| {
+                const layout = layoutForWindows(cols, present, label_cols);
+                rl_theme.bar_width = @min(theme.bar_width, layout.bar_width);
+                rl_theme.reset_info = layout.reset_info;
+            }
         }
-
-        if (stdin_info.rate_limit_7d) |rl7| {
-            try w.print("\xf0\x9f\x93\x85 ", .{}); // 📅
-            try writeRateLimitWindow(w, theme, "7d", rl7, now_ms, utc_offset_s);
+        var first = true;
+        for (slots) |slot| {
+            const rl = slot.window orelse continue;
+            if (!first) try w.print(" {s}|{s} ", .{ theme.dim, theme.reset });
+            first = false;
+            try w.print("{s} ", .{slot.emoji});
+            try writeRateLimitWindow(w, rl_theme, slot.label, rl, now_ms, utc_offset_s);
         }
-
         try w.writeAll("\n");
     }
 }
@@ -1784,6 +1826,101 @@ test "printOutput line3 both rate limits with separator" {
     try std.testing.expectEqual(@as(usize, 3), countNewlines(out));
 }
 
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var i: usize = 0;
+    while (mem.indexOfPos(u8, haystack, i, needle)) |pos| : (i = pos + needle.len) count += 1;
+    return count;
+}
+
+test "printOutput line3 spend limit over 100% shows the raw figure in red with a full bar" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{
+        .rate_limit_spend = .{ .used_percentage = 120.0 },
+    };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    try std.testing.expect(contains(out, "\xf0\x9f\x92\xb3 ")); // 💳
+    try std.testing.expect(contains(out, "120%"));
+    try std.testing.expect(contains(out, theme_default.red));
+    // buildProgressBar clamps to 100%: ten filled cells, no transition or empty cell.
+    try std.testing.expectEqual(@as(usize, 10), countOccurrences(out, theme_default.bar_filled));
+    try std.testing.expect(!contains(out, theme_default.bar_empty));
+    try std.testing.expect(!contains(out, "\xf0\x9f\x95\x94")); // 🕔 belongs to 5h only
+}
+
+test "printOutput line3 three windows carry two dividers" {
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    const info = StdinInfo{
+        .rate_limit_5h = .{ .used_percentage = 30.0 },
+        .rate_limit_7d = .{ .used_percentage = 60.0 },
+        .rate_limit_spend = .{ .used_percentage = 12.0 },
+    };
+    try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    const line3 = out[mem.lastIndexOfScalar(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
+    try std.testing.expectEqual(@as(usize, 2), countOccurrences(line3, theme_default.dim ++ "|" ++ theme_default.reset));
+    try std.testing.expect(contains(line3, "\xf0\x9f\x95\x94 ")); // 🕔
+    try std.testing.expect(contains(line3, "\xf0\x9f\x93\x85 ")); // 📅
+    try std.testing.expect(contains(line3, "\xf0\x9f\x92\xb3 ")); // 💳
+}
+
+test "pctExtraCols counts digits beyond 100%" {
+    try std.testing.expectEqual(@as(u16, 0), pctExtraCols(0));
+    try std.testing.expectEqual(@as(u16, 0), pctExtraCols(100));
+    try std.testing.expectEqual(@as(u16, 0), pctExtraCols(999.4));
+    try std.testing.expectEqual(@as(u16, 1), pctExtraCols(999.5));
+    try std.testing.expectEqual(@as(u16, 1), pctExtraCols(1000));
+    try std.testing.expectEqual(@as(u16, 2), pctExtraCols(12345));
+    try std.testing.expectEqual(@as(u16, 0), pctExtraCols(-5));
+}
+
+test "printOutput line3 a five-digit spend percentage is budgeted into the layout" {
+    // 95 columns holds three bar-less windows with full reset info when every
+    // percentage is four columns; "1000%" is one wider, so the datetime must go.
+    var theme = theme_default;
+    theme.cols = 95;
+    theme.bar_width = 10;
+    theme.reset_info = .full;
+    const info = StdinInfo{
+        .rate_limit_5h = .{ .used_percentage = 100.0, .resets_at_ms = 3600 * 1000 },
+        .rate_limit_7d = .{ .used_percentage = 100.0, .resets_at_ms = 3600 * 1000 },
+        .rate_limit_spend = .{ .used_percentage = 1000.0, .resets_at_ms = 3600 * 1000 },
+    };
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    const line3 = out[mem.lastIndexOfScalar(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
+    try std.testing.expect(contains(line3, "1000%"));
+    try std.testing.expect(displayWidth(line3) <= 95);
+    try std.testing.expect(!contains(line3, "01/01"));
+}
+
+test "printOutput line3 three windows narrow the layout to fit COLUMNS" {
+    // 85 columns keeps the full 10-cell bar for two windows but cannot hold
+    // three, so the third window forces the narrower layout on the whole line.
+    var theme = theme_default;
+    theme.cols = 85;
+    theme.bar_width = 10;
+    theme.reset_info = .full;
+    const info = StdinInfo{
+        .rate_limit_5h = .{ .used_percentage = 30.0, .resets_at_ms = 3600 * 1000 },
+        .rate_limit_7d = .{ .used_percentage = 60.0, .resets_at_ms = 3600 * 1000 },
+        .rate_limit_spend = .{ .used_percentage = 12.0, .resets_at_ms = 3600 * 1000 },
+    };
+    var aw: Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+    try printOutput(&aw.writer, theme, info, null, 0, 0, null);
+    const out = aw.writer.buffered();
+    const line3 = out[mem.lastIndexOfScalar(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
+    try std.testing.expect(displayWidth(line3) <= 85);
+    try std.testing.expect(!contains(line3, theme.bar_filled));
+    try std.testing.expect(contains(line3, "1h 0m"));
+}
+
 test "printOutput line3 rate limit reset time" {
     var aw: Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
@@ -2047,6 +2184,27 @@ test "layoutForColumns reset-info breakpoints" {
     // Duration dropped too.
     try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, layoutForColumns(38));
     try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, layoutForColumns(0));
+}
+
+test "layoutForWindows three windows is never wider than two at the same COLUMNS" {
+    var cols: u16 = 0;
+    while (cols <= 200) : (cols += 1) {
+        const two = layoutForColumns(cols);
+        const three = layoutForWindows(cols, 3, 5);
+        try std.testing.expect(three.bar_width <= two.bar_width);
+        try std.testing.expect(@intFromEnum(three.reset_info) >= @intFromEnum(two.reset_info));
+    }
+}
+
+test "layoutForWindows three-window breakpoints" {
+    // fixed_full = 5 + 75 + 9 + 6 = 95; bar W adds (W + 1) * 3.
+    try std.testing.expectEqual(Layout{ .bar_width = 10, .reset_info = .full }, layoutForWindows(128, 3, 5));
+    try std.testing.expectEqual(Layout{ .bar_width = 8, .reset_info = .full }, layoutForWindows(127, 3, 5));
+    try std.testing.expectEqual(Layout{ .bar_width = 2, .reset_info = .full }, layoutForWindows(104, 3, 5));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .full }, layoutForWindows(95, 3, 5));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .duration_only }, layoutForWindows(94, 3, 5));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .duration_only }, layoutForWindows(59, 3, 5));
+    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, layoutForWindows(58, 3, 5));
 }
 
 test "parseLayout fallback and parsing" {

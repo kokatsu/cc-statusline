@@ -106,6 +106,8 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
     if (getObjField(root, "rate_limits")) |rl| {
         if (getObjField(rl, "five_hour")) |fh| info.rate_limit_5h = parseRateLimitWindow(fh);
         if (getObjField(rl, "seven_day")) |sd| info.rate_limit_7d = parseRateLimitWindow(sd);
+        // spend_limit added in Claude Code v2.1.251 (apps gateway only)
+        if (getObjField(rl, "spend_limit")) |sl| info.rate_limit_spend = parseRateLimitWindow(sl);
     }
 
     // Parse prompt_cache (added in Claude Code v2.1.251)
@@ -369,6 +371,19 @@ test "parseStdin rate_limits partial (5h only, no resets_at)" {
     try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_7d);
 }
 
+test "parseStdin rate_limits spend_limit" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"rate_limits":{"spend_limit":{"used_percentage":120.5,"resets_at":1742774400}}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_5h);
+    try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_7d);
+    try std.testing.expectApproxEqAbs(@as(f64, 120.5), info.rate_limit_spend.?.used_percentage, 1e-10);
+    try std.testing.expectEqual(@as(i64, 1742774400 * 1000), info.rate_limit_spend.?.resets_at_ms.?);
+}
+
 test "parseStdin no rate_limits" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -378,6 +393,7 @@ test "parseStdin no rate_limits" {
     const info = parseStdin(arena.allocator(), input);
     try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_5h);
     try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_7d);
+    try std.testing.expectEqual(@as(?RateLimitWindow, null), info.rate_limit_spend);
 }
 
 test "parseStdin prompt_cache full" {

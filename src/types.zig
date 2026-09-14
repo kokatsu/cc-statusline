@@ -82,6 +82,9 @@ pub const StdinInfo = struct {
     cwd: ?[]const u8 = null,
     rate_limit_5h: ?RateLimitWindow = null,
     rate_limit_7d: ?RateLimitWindow = null,
+    /// Claude apps gateway spend limit. Its `used_percentage` may exceed 100
+    /// once the limit is passed.
+    rate_limit_spend: ?RateLimitWindow = null,
     prompt_cache: ?PromptCache = null,
     agent_name: ?[]const u8 = null,
     exceeds_200k_tokens: bool = false,
