@@ -129,35 +129,69 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
 // ============================================================
 
 fn getGitBranch(io: std.Io, buf: *[256]u8, cwd: []const u8) ?[]const u8 {
-    // Walk up from cwd looking for .git/HEAD
-    var path_buf: [4096]u8 = undefined;
+    // Walk up from cwd looking for a .git directory or pointer file
     var dir = cwd;
-
     while (true) {
-        const head_path = std.fmt.bufPrint(&path_buf, "{s}/.git/HEAD", .{dir}) catch return null;
-        if (readGitHead(io, buf, head_path)) |branch| return branch;
+        if (readBranchAt(io, buf, dir)) |branch| return branch;
 
         // Move to parent directory
-        if (mem.lastIndexOfScalar(u8, dir, '/')) |sep| {
-            if (sep == 0) {
-                return readGitHead(io, buf, "/.git/HEAD");
-            }
-            dir = dir[0..sep];
-        } else {
-            return null;
-        }
+        const sep = mem.lastIndexOfScalar(u8, dir, '/') orelse return null;
+        if (sep == 0) return readBranchAt(io, buf, "");
+        dir = dir[0..sep];
     }
 }
 
-fn readGitHead(io: std.Io, buf: *[256]u8, path: []const u8) ?[]const u8 {
-    var f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+/// Branch for the repository rooted at `dir`. A linked worktree (`git
+/// worktree add`) has a `.git` *file* holding `gitdir: <path>` instead of a
+/// directory, so when `<dir>/.git/HEAD` cannot be read the pointer is
+/// followed to `<gitdir>/HEAD`.
+fn readBranchAt(io: std.Io, buf: *[256]u8, dir: []const u8) ?[]const u8 {
+    var path_buf: [4096]u8 = undefined;
+    const head_path = std.fmt.bufPrint(&path_buf, "{s}/.git/HEAD", .{dir}) catch return null;
+    if (readGitHead(io, buf, head_path)) |branch| return branch;
+
+    const dotgit_path = std.fmt.bufPrint(&path_buf, "{s}/.git", .{dir}) catch return null;
+    var pointer_buf: [4096]u8 = undefined;
+    const pointer = readSmallFile(io, &pointer_buf, dotgit_path) orelse return null;
+    const gitdir = parseGitdirPointer(pointer) orelse return null;
+    // `worktree.useRelativePaths` (and submodules) write the pointer relative
+    // to the directory holding the `.git` file.
+    const wt_head_path = if (gitdir[0] == '/')
+        std.fmt.bufPrint(&path_buf, "{s}/HEAD", .{gitdir}) catch return null
+    else
+        std.fmt.bufPrint(&path_buf, "{s}/{s}/HEAD", .{ dir, gitdir }) catch return null;
+    return readGitHead(io, buf, wt_head_path);
+}
+
+/// Whole file into `buf`, or null when it cannot be read or does not fit.
+/// A truncated ref would render as a wrong branch rather than none, so an
+/// exact fit is accepted only once a further read confirms EOF.
+fn readSmallFile(io: std.Io, buf: []u8, path: []const u8) ?[]const u8 {
+    var f = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer f.close(io);
-    var reader = f.readerStreaming(io, buf);
-    const data = reader.interface.allocRemaining(std.heap.page_allocator, .limited(256)) catch return null;
-    defer std.heap.page_allocator.free(data);
-    const n = @min(data.len, buf.len);
-    @memcpy(buf[0..n], data[0..n]);
-    return parseGitHead(buf[0..n]);
+    var reader = f.reader(io, &.{});
+    const n = reader.interface.readSliceShort(buf) catch return null;
+    if (n == buf.len) {
+        var extra: [1]u8 = undefined;
+        const more = reader.interface.readSliceShort(&extra) catch return null;
+        if (more != 0) return null;
+    }
+    return buf[0..n];
+}
+
+fn readGitHead(io: std.Io, buf: *[256]u8, path: []const u8) ?[]const u8 {
+    const data = readSmallFile(io, buf, path) orelse return null;
+    return parseGitHead(data);
+}
+
+/// Target of a `.git` pointer file (`gitdir: <path>`), absolute or relative.
+fn parseGitdirPointer(raw: []const u8) ?[]const u8 {
+    const prefix = "gitdir: ";
+    if (!mem.startsWith(u8, raw, prefix)) return null;
+    var path = raw[prefix.len..];
+    if (path.len > 0 and path[path.len - 1] == '\n') path = path[0 .. path.len - 1];
+    if (path.len == 0) return null;
+    return path;
 }
 
 fn parseGitHead(raw: []const u8) ?[]const u8 {
@@ -596,6 +630,23 @@ test "parseGitHead no trailing newline" {
     try std.testing.expectEqualStrings("abc1234", parseGitHead("abc1234def5678901234567890abcdef01234567").?);
 }
 
+// --- parseGitdirPointer ---
+
+test "parseGitdirPointer absolute path" {
+    try std.testing.expectEqualStrings("/repo/.git/worktrees/wt", parseGitdirPointer("gitdir: /repo/.git/worktrees/wt\n").?);
+    try std.testing.expectEqualStrings("/repo/.git/worktrees/wt", parseGitdirPointer("gitdir: /repo/.git/worktrees/wt").?);
+}
+
+test "parseGitdirPointer keeps relative paths for the caller to resolve" {
+    try std.testing.expectEqualStrings("../main/.git/worktrees/wt", parseGitdirPointer("gitdir: ../main/.git/worktrees/wt\n").?);
+}
+
+test "parseGitdirPointer rejects missing prefix and empty" {
+    try std.testing.expectEqual(@as(?[]const u8, null), parseGitdirPointer("ref: refs/heads/main\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parseGitdirPointer("gitdir: \n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), parseGitdirPointer(""));
+}
+
 test "parseStdin empty input sets stdin_absent" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -664,6 +715,76 @@ test "getGitBranch walks up to parent" {
     const branch = getGitBranch(io, &buf, sub_sub);
     try std.testing.expect(branch != null);
     try std.testing.expectEqualStrings("feature-x", branch.?);
+}
+
+test "getGitBranch follows a linked worktree's .git pointer file" {
+    const io = std.testing.io;
+    const base = "/tmp/cc-test-gitbranch-worktree";
+    const gitdir = base ++ "/main/.git/worktrees/wt";
+    const wt = base ++ "/wt";
+    Io.Dir.createDirAbsolute(io, base, .default_dir) catch {};
+    Io.Dir.createDirAbsolute(io, base ++ "/main", .default_dir) catch {};
+    Io.Dir.createDirAbsolute(io, base ++ "/main/.git", .default_dir) catch {};
+    Io.Dir.createDirAbsolute(io, base ++ "/main/.git/worktrees", .default_dir) catch {};
+    Io.Dir.createDirAbsolute(io, gitdir, .default_dir) catch {};
+    Io.Dir.createDirAbsolute(io, wt, .default_dir) catch {};
+    defer {
+        Io.Dir.deleteFileAbsolute(io, gitdir ++ "/HEAD") catch {};
+        Io.Dir.deleteFileAbsolute(io, wt ++ "/.git") catch {};
+        Io.Dir.deleteDirAbsolute(io, wt) catch {};
+        Io.Dir.deleteDirAbsolute(io, gitdir) catch {};
+        Io.Dir.deleteDirAbsolute(io, base ++ "/main/.git/worktrees") catch {};
+        Io.Dir.deleteDirAbsolute(io, base ++ "/main/.git") catch {};
+        Io.Dir.deleteDirAbsolute(io, base ++ "/main") catch {};
+        Io.Dir.deleteDirAbsolute(io, base) catch {};
+    }
+    {
+        var f = try Io.Dir.createFileAbsolute(io, gitdir ++ "/HEAD", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "ref: refs/heads/feature-wt\n");
+    }
+    {
+        var f = try Io.Dir.createFileAbsolute(io, wt ++ "/.git", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "gitdir: " ++ gitdir ++ "\n");
+    }
+    var buf: [256]u8 = undefined;
+    const branch = getGitBranch(io, &buf, wt);
+    try std.testing.expect(branch != null);
+    try std.testing.expectEqualStrings("feature-wt", branch.?);
+
+    // worktree.useRelativePaths=true writes the pointer relative to the worktree.
+    {
+        var f = try Io.Dir.createFileAbsolute(io, wt ++ "/.git", .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, "gitdir: ../main/.git/worktrees/wt\n");
+    }
+    const rel_branch = getGitBranch(io, &buf, wt);
+    try std.testing.expect(rel_branch != null);
+    try std.testing.expectEqualStrings("feature-wt", rel_branch.?);
+}
+
+test "readGitHead accepts a HEAD that exactly fills the buffer and rejects a longer one" {
+    const io = std.testing.io;
+    const path = "/tmp/cc-test-githead-exact";
+    defer Io.Dir.deleteFileAbsolute(io, path) catch {};
+    const prefix = "ref: refs/heads/";
+    // prefix (16) + 239 + "\n" = 256 bytes, the buffer size exactly.
+    const exact = prefix ++ ("b" ** 239) ++ "\n";
+    comptime std.debug.assert(exact.len == 256);
+    {
+        var f = try Io.Dir.createFileAbsolute(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, exact);
+    }
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("b" ** 239, readGitHead(io, &buf, path).?);
+    {
+        var f = try Io.Dir.createFileAbsolute(io, path, .{});
+        defer f.close(io);
+        try f.writeStreamingAll(io, prefix ++ ("b" ** 240) ++ "\n");
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), readGitHead(io, &buf, path));
 }
 
 test "getGitBranch returns null when no .git/HEAD" {
