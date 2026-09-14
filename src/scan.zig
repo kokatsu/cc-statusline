@@ -1157,19 +1157,40 @@ fn logWriteCacheError(path: []const u8, err: anyerror) void {
     } else |_| {}
 }
 
+/// Unique-per-call suffix for the cache temp file. Concurrent Claude Code
+/// sessions each run their own cc-statusline, and a shared `.tmp` name let
+/// two writers truncate and interleave into one inode before the rename.
+/// There is no libc, so no portable getpid; the awake clock in nanoseconds
+/// is as unique as two processes can be. `exclusive` then makes an actual
+/// collision a skipped write rather than a corrupt one.
+fn cacheTmpPath(buf: []u8, cp: []const u8) ?[]const u8 {
+    const ns: u64 = @bitCast(@as(i64, @intCast(Io.Clock.awake.now(g_io).nanoseconds)));
+    return std.fmt.bufPrint(buf, "{s}.{x}.tmp", .{ cp, ns }) catch null;
+}
+
 fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, cp: []const u8) void {
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{cp}) catch return;
-    var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{}) catch |err| {
-        logWriteCacheError(tmp_path, err);
+    const tmp_path = cacheTmpPath(&tmp_buf, cp) orelse return;
+    var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{ .exclusive = true }) catch |err| {
+        if (err != error.PathAlreadyExists) logWriteCacheError(tmp_path, err);
         return;
     };
     defer f.close(g_io);
     var wbuf: [8192]u8 = undefined;
     var writer = f.writerStreaming(g_io, &wbuf);
-    serializeCacheBytes(&writer.interface, result, files, now_s, last_full_scan_s, day_start_ms) catch return;
-    writer.interface.flush() catch return;
-    Io.Dir.renameAbsolute(tmp_path, cp, g_io) catch |err| logWriteCacheError(cp, err);
+    const written = blk: {
+        serializeCacheBytes(&writer.interface, result, files, now_s, last_full_scan_s, day_start_ms) catch break :blk false;
+        writer.interface.flush() catch break :blk false;
+        break :blk true;
+    };
+    if (!written) {
+        Io.Dir.deleteFileAbsolute(g_io, tmp_path) catch {};
+        return;
+    }
+    Io.Dir.renameAbsolute(tmp_path, cp, g_io) catch |err| {
+        logWriteCacheError(cp, err);
+        Io.Dir.deleteFileAbsolute(g_io, tmp_path) catch {};
+    };
 }
 
 // ============================================================
@@ -1810,6 +1831,44 @@ test "cache day boundary invalidation" {
     // Different day_start_ms should return null
     const different_day: i64 = day_start_ms + 86400 * 1000;
     try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, aw.writer.buffered(), different_day));
+}
+
+test "cacheTmpPath is unique per call and keeps the cache path as prefix" {
+    g_io = std.testing.io;
+    var a: [std.fs.max_path_bytes]u8 = undefined;
+    var b: [std.fs.max_path_bytes]u8 = undefined;
+    const pa = cacheTmpPath(&a, "/tmp/cc-test-cache.bin").?;
+    const pb = cacheTmpPath(&b, "/tmp/cc-test-cache.bin").?;
+    try std.testing.expect(mem.startsWith(u8, pa, "/tmp/cc-test-cache.bin."));
+    try std.testing.expect(mem.endsWith(u8, pa, ".tmp"));
+    try std.testing.expect(!mem.eql(u8, pa, pb));
+}
+
+test "writeCache leaves only the renamed cache behind" {
+    g_io = std.testing.io;
+    const dir = "/tmp/cc-test-writecache";
+    const cp = dir ++ "/" ++ cache_name;
+    Io.Dir.createDirAbsolute(std.testing.io, dir, .default_dir) catch {};
+    defer {
+        Io.Dir.deleteFileAbsolute(std.testing.io, cp) catch {};
+        Io.Dir.deleteDirAbsolute(std.testing.io, dir) catch {};
+    }
+    writeCache(.{ .today_cost = 1.0 }, &.{}, 100, 100, 0, cp);
+
+    var d = try Io.Dir.openDirAbsolute(std.testing.io, dir, .{ .iterate = true });
+    defer d.close(std.testing.io);
+    var count: usize = 0;
+    var it = d.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings(cache_name, entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const cached = readCache(arena.allocator(), 0, cp) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), cached.scan.today_cost, 1e-10);
 }
 
 test "cache invalid magic" {
