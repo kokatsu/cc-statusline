@@ -77,13 +77,6 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
         if (model.get("id")) |id| info.model_id = getStr(id);
         if (model.get("display_name")) |name| info.model_name = getStr(name);
     }
-    if (getObjField(root, "cost")) |cost| {
-        if (cost.get("total_cost_usd")) |usd| info.session_cost = getF64(usd);
-        if (cost.get("total_lines_added")) |la| info.lines_added = getI64(la);
-        if (cost.get("total_lines_removed")) |lr| info.lines_removed = getI64(lr);
-        // getI64 handles both .integer and .float, and range-checks the latter.
-        if (cost.get("total_duration_ms")) |dur| info.session_duration_ms = getI64(dur);
-    }
     if (getObjField(root, "context_window")) |ctx| {
         if (ctx.get("used_percentage")) |pct| info.context_pct = getF64(pct);
         if (ctx.get("context_window_size")) |sz| info.context_window_size = getI64(sz);
@@ -98,9 +91,7 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
             info.context_tokens = getI64(t);
         }
     }
-    if (root.get("session_id")) |v| info.session_id = getStr(v);
     if (root.get("session_name")) |v| info.session_name = getStr(v);
-    if (root.get("transcript_path")) |v| info.transcript_path = getStr(v);
     if (root.get("cwd")) |v| info.cwd = getStr(v);
 
     // Parse rate_limits (added in Claude Code v2.1.80)
@@ -308,8 +299,6 @@ test "parseStdin basic fields" {
     const info = parseStdin(arena.allocator(), input);
     try std.testing.expectEqualStrings("claude-opus-4-6", info.model_id.?);
     try std.testing.expectEqualStrings("Opus", info.model_name.?);
-    try std.testing.expectApproxEqAbs(@as(f64, 1.5), info.session_cost.?, 1e-10);
-    try std.testing.expectEqualStrings("abc-123", info.session_id.?);
 }
 
 test "parseStdin empty input" {
@@ -317,7 +306,6 @@ test "parseStdin empty input" {
     defer arena.deinit();
     const info = parseStdin(arena.allocator(), "");
     try std.testing.expectEqual(@as(?[]const u8, null), info.model_id);
-    try std.testing.expectEqual(@as(?f64, null), info.session_cost);
     try std.testing.expectEqual(@as(?f64, null), info.context_pct);
     try std.testing.expectEqual(@as(?i64, null), info.context_tokens);
 }
@@ -461,11 +449,9 @@ test "parseStdin rejects out-of-range numerics without trapping" {
     // Every value here traps on an unchecked conversion: 1e20 is a finite
     // f64 outside i64, and 1e16 seconds overflows i64 when scaled to ms.
     const input =
-        \\{"cost":{"total_duration_ms":1e20},"rate_limits":{"five_hour":{"used_percentage":42.0,"resets_at":1e20},"seven_day":{"used_percentage":10.0,"resets_at":10000000000000000}},"prompt_cache":{"caching_observed":true,"expires_at":1e20,"hit_ratio":0.5}}
+        \\{"rate_limits":{"five_hour":{"used_percentage":42.0,"resets_at":1e20},"seven_day":{"used_percentage":10.0,"resets_at":10000000000000000}},"prompt_cache":{"caching_observed":true,"expires_at":1e20,"hit_ratio":0.5}}
     ;
     const info = parseStdin(arena.allocator(), input);
-
-    try std.testing.expectEqual(@as(?i64, null), info.session_duration_ms);
 
     // The window survives; only the unusable reset time drops out.
     try std.testing.expectApproxEqAbs(@as(f64, 42.0), info.rate_limit_5h.?.used_percentage, 1e-10);
@@ -494,19 +480,6 @@ test "parseStdin no prompt_cache" {
     ;
     const info = parseStdin(arena.allocator(), input);
     try std.testing.expectEqual(@as(?PromptCache, null), info.prompt_cache);
-}
-
-test "parseStdin cost and line fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const input =
-        \\{"cost":{"total_cost_usd":2.5,"total_lines_added":150,"total_lines_removed":30,"total_duration_ms":60000}}
-    ;
-    const info = parseStdin(arena.allocator(), input);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.5), info.session_cost.?, 1e-10);
-    try std.testing.expectEqual(@as(?i64, 150), info.lines_added);
-    try std.testing.expectEqual(@as(?i64, 30), info.lines_removed);
-    try std.testing.expectEqual(@as(?i64, 60000), info.session_duration_ms);
 }
 
 test "parseStdin agent.name" {
@@ -611,15 +584,11 @@ test "parseStdin exceeds_200k_tokens missing defaults to false" {
     try std.testing.expectEqual(false, info.exceeds_200k_tokens);
 }
 
-test "parseStdin cwd and transcript_path" {
+test "parseStdin cwd" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const input =
-        \\{"cwd":"/home/user/project","transcript_path":"/home/user/.claude/projects/abc/transcript.jsonl"}
-    ;
-    const info = parseStdin(arena.allocator(), input);
+    const info = parseStdin(arena.allocator(), "{\"cwd\":\"/home/user/project\"}");
     try std.testing.expectEqualStrings("/home/user/project", info.cwd.?);
-    try std.testing.expectEqualStrings("/home/user/.claude/projects/abc/transcript.jsonl", info.transcript_path.?);
 }
 
 // --- parseGitHead ---
@@ -676,7 +645,6 @@ test "parseStdin invalid json" {
     const info = parseStdin(arena.allocator(), "{broken");
     try std.testing.expect(!info.stdin_absent);
     try std.testing.expectEqual(@as(?[]const u8, null), info.model_id);
-    try std.testing.expectEqual(@as(?f64, null), info.session_cost);
     try std.testing.expectEqual(@as(?f64, null), info.context_pct);
 }
 

@@ -975,20 +975,6 @@ fn computeBlock(entries: []TranscriptEntry, now_ms: i64, resets_at_ms: ?i64) ?Bl
     ) else identifyActiveBlock(entries, now_ms);
 }
 
-fn computeCosts(entries: []TranscriptEntry, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64) ScanResult {
-    var today_cost: f64 = 0;
-    for (entries) |entry| {
-        if (entry.timestamp_ms >= day_start_ms) {
-            today_cost += entryCost(entry);
-        }
-    }
-
-    return .{
-        .today_cost = today_cost,
-        .block = computeBlock(entries, now_ms, resets_at_ms),
-    };
-}
-
 // ============================================================
 // Cache
 // ============================================================
@@ -1579,41 +1565,6 @@ test "identifyActiveBlock gap detection" {
     try std.testing.expect(block.?.start_ms >= base_ms + gap - 3600 * 1000);
 }
 
-test "computeCosts today entries only" {
-    const now_ms: i64 = (time.daysFromCivil(2025, 6, 15) * 86400 + 12 * 3600) * 1000;
-    const today_entry = TranscriptEntry{
-        .timestamp_ms = now_ms - 2 * 3600 * 1000,
-        .model = "claude-sonnet-4-5-20250929",
-        .usage = .{ .input_tokens = 1000, .output_tokens = 500 },
-    };
-    const old_entry = TranscriptEntry{
-        .timestamp_ms = now_ms - 30 * 3600 * 1000,
-        .model = "claude-sonnet-4-5-20250929",
-        .usage = .{ .input_tokens = 5000, .output_tokens = 2000 },
-    };
-
-    var entries = [_]TranscriptEntry{ old_entry, today_entry };
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
-    const result = computeCosts(&entries, now_ms, day_start_ms, null);
-    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
-    const expected_today = pricing.calculateEntryCost(p, today_entry.usage);
-    try std.testing.expectApproxEqAbs(expected_today, result.today_cost, 1e-10);
-}
-
-test "computeCosts old entries excluded from today" {
-    const now_ms: i64 = (time.daysFromCivil(2025, 6, 15) * 86400 + 12 * 3600) * 1000;
-    var entries = [_]TranscriptEntry{
-        .{ .timestamp_ms = now_ms - 48 * 3600 * 1000, .model = "claude-sonnet-4-5-20250929", .usage = .{ .input_tokens = 5000, .output_tokens = 2000 } },
-    };
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
-    const result = computeCosts(&entries, now_ms, day_start_ms, null);
-    try std.testing.expectApproxEqAbs(@as(f64, 0), result.today_cost, 1e-10);
-}
-
 test "parseJsonlContent global dedup across files" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1918,7 +1869,7 @@ test "computeBlockFromWindow empty window" {
     try std.testing.expectEqual(@as(?BlockInfo, null), block);
 }
 
-test "computeCosts with resets_at_ms uses window" {
+test "computeBlock with resets_at_ms uses window" {
     const now_ms: i64 = (time.daysFromCivil(2025, 6, 15) * 86400 + 12 * 3600) * 1000;
     const resets_at_ms: i64 = now_ms + 3 * 3600 * 1000; // resets 3h from now
     const window_start = resets_at_ms - block_duration_ms; // started 2h ago
@@ -1935,18 +1886,14 @@ test "computeCosts with resets_at_ms uses window" {
     };
 
     var entries = [_]TranscriptEntry{ outside_window, in_window };
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
-    const result = computeCosts(&entries, now_ms, day_start_ms, resets_at_ms);
+    const block = computeBlock(&entries, now_ms, resets_at_ms) orelse return error.TestUnexpectedResult;
 
-    try std.testing.expect(result.block != null);
-    try std.testing.expectEqual(window_start, result.block.?.start_ms);
-    try std.testing.expectEqual(resets_at_ms, result.block.?.end_ms);
+    try std.testing.expectEqual(window_start, block.start_ms);
+    try std.testing.expectEqual(resets_at_ms, block.end_ms);
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
     const expected_cost = pricing.calculateEntryCost(p, in_window.usage);
-    try std.testing.expectApproxEqAbs(expected_cost, result.block.?.cost, 1e-10);
+    try std.testing.expectApproxEqAbs(expected_cost, block.cost, 1e-10);
 }
 
 // --- resolveConfigDir ---
@@ -2679,44 +2626,44 @@ test "computeBlockFromWindow now_ms before window clamps elapsed" {
     try std.testing.expect(block.?.burn_rate_per_hr > 0);
 }
 
-// --- computeCosts boundary conditions ---
+// --- computeBlock boundary conditions ---
 
-test "computeCosts entry exactly at today_start_ms" {
+test "computeBlock resets_at_ms with no entries in window" {
     const now_ms: i64 = (time.daysFromCivil(2025, 6, 15) * 86400 + 12 * 3600) * 1000;
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    const today_start = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
-    var entries = [_]TranscriptEntry{
-        .{ .timestamp_ms = today_start, .model = "claude-sonnet-4-5-20250929", .usage = .{ .input_tokens = 1000, .output_tokens = 500 } },
-    };
-    const result = computeCosts(&entries, now_ms, today_start, null);
-    try std.testing.expect(result.today_cost > 0);
-}
-
-test "computeCosts unknown model contributes zero cost" {
-    const now_ms: i64 = (time.daysFromCivil(2025, 6, 15) * 86400 + 12 * 3600) * 1000;
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
-    var entries = [_]TranscriptEntry{
-        .{ .timestamp_ms = now_ms - 1000, .model = "unknown-xyz", .usage = .{ .input_tokens = 1000, .output_tokens = 500 } },
-    };
-    const result = computeCosts(&entries, now_ms, day_start_ms, null);
-    try std.testing.expectApproxEqAbs(@as(f64, 0), result.today_cost, 1e-10);
-}
-
-test "computeCosts resets_at_ms with no entries in window" {
-    const now_ms: i64 = (time.daysFromCivil(2025, 6, 15) * 86400 + 12 * 3600) * 1000;
-    var env: std.process.Environ.Map = .init(std.testing.allocator);
-    defer env.deinit();
-    const day_start_ms = time.getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
     const resets_at_ms: i64 = now_ms + 3 * 3600 * 1000;
     // Entry is far before the window
     var entries = [_]TranscriptEntry{
         .{ .timestamp_ms = resets_at_ms - 2 * block_duration_ms, .model = "claude-sonnet-4-5-20250929", .usage = .{ .input_tokens = 1000, .output_tokens = 500 } },
     };
-    const result = computeCosts(&entries, now_ms, day_start_ms, resets_at_ms);
-    try std.testing.expectEqual(@as(?BlockInfo, null), result.block);
+    try std.testing.expectEqual(@as(?BlockInfo, null), computeBlock(&entries, now_ms, resets_at_ms));
+}
+
+test "fullScan today cost counts entries from the day start on and prices unknown models at zero" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
+
+    // Day starts 2025-06-15T00:00Z; now is noon. One entry 30h ago (yesterday),
+    // one exactly at the day boundary, one 2h ago, one unpriced model.
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const content =
+        \\{"timestamp":"2025-06-14T06:00:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":5000,"output_tokens":2000}}}
+        \\{"timestamp":"2025-06-15T00:00:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
+        \\{"timestamp":"2025-06-15T11:00:00Z","message":{"model":"unknown-xyz","usage":{"input_tokens":1000,"output_tokens":500}}}
+        \\
+    ;
+    try createTmpFile(try tree.path("projects/proj/session.jsonl"), content);
+
+    const result = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, try tree.path("cache.bin"));
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+    const one = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 500 });
+    try std.testing.expectApproxEqAbs(2 * one, result.today_cost, 1e-10);
 }
 
 // --- parseCacheBytes corruption ---

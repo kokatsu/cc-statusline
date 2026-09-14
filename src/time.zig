@@ -91,13 +91,6 @@ pub fn computeLocalDayStartMs(now_ms: i64, utc_offset_s: i32) i64 {
     return (local_day_start_s - offset_s) * 1000;
 }
 
-/// Get the start of today in milliseconds (local timezone, pure Zig)
-pub fn getLocalDayStartMs(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64) i64 {
-    const now_s = @divFloor(now_ms, @as(i64, 1000));
-    const offset_s = getUtcOffsetSeconds(io, env, allocator, now_s);
-    return computeLocalDayStartMs(now_ms, offset_s);
-}
-
 pub fn floorToHourMs(ms: i64) i64 {
     const ms_per_hour: i64 = 3600 * 1000;
     return @divFloor(ms, ms_per_hour) * ms_per_hour;
@@ -376,15 +369,21 @@ test "floorToHourMs" {
     try std.testing.expectEqual(@as(i64, 0), floorToHourMs(0));
 }
 
-test "getLocalDayStartMs returns valid day boundary" {
-    const now_ms: i64 = std.Io.Clock.real.now(std.testing.io).toMilliseconds();
+test "getUtcOffsetSeconds with an empty environment yields a plausible offset" {
+    const now_s: i64 = std.Io.Clock.real.now(std.testing.io).toSeconds();
     var env: std.process.Environ.Map = .init(std.testing.allocator);
     defer env.deinit();
-    const day_start = getLocalDayStartMs(std.testing.io, &env, std.testing.allocator, now_ms);
-    try std.testing.expect(day_start <= now_ms);
-    try std.testing.expect(now_ms - day_start < 86400 * 1000);
-    const diff_ms = day_start - @divFloor(day_start, @as(i64, 1000)) * 1000;
-    try std.testing.expectEqual(@as(i64, 0), diff_ms);
+    const offset = getUtcOffsetSeconds(std.testing.io, &env, std.testing.allocator, now_s);
+    try std.testing.expect(offset >= -14 * 3600 and offset <= 14 * 3600);
+}
+
+test "getUtcOffsetSeconds honors a fixed-offset TZ" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("TZ", "JST-9");
+    try std.testing.expectEqual(@as(i32, 32400), getUtcOffsetSeconds(std.testing.io, &env, std.testing.allocator, 0));
+    try env.put("TZ", "UTC");
+    try std.testing.expectEqual(@as(i32, 0), getUtcOffsetSeconds(std.testing.io, &env, std.testing.allocator, 0));
 }
 
 test "computeLocalDayStartMs UTC" {
