@@ -270,7 +270,7 @@ fn handleLine(
 /// `std.json.Scanner` to bypass DFA tokenization, allocator plumbing, and
 /// escape decoding; we only need fixed ASCII keys and raw byte values.
 ///
-/// Schema assumptions (see `bench/CANDIDATES.md` (12)):
+/// Schema assumptions, checked against real Claude Code transcripts:
 /// - Object keys are ASCII without escapes, so a key boundary is the next `"`.
 /// - String values are returned as raw byte slices; escape sequences are not
 ///   decoded. Boundary detection treats `\<any>` as a 2-byte advance, which

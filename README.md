@@ -13,9 +13,9 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour (opt-out via `CC_STATUSLINE_SHOW_COST=0`)
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown, plus the spend limit (💳) behind a Claude apps gateway
 - **Prompt Cache** — Warm/cold state with a TTL-relative countdown (💾), cache hit ratio (🎯), and the dollar cost of re-caching if the prefix goes cold (💸), priced from the model's cache-write rate (opt-in via `CC_STATUSLINE_SHOW_CACHE=1`)
-- **Smart Caching** — Two-tier binary cache (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
+- **Smart Caching** — Two-tier binary cache at `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/statusline-cache.bin` (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
 - **Pricing** — Supports Fable 5.1/5, Mythos 5.1/5, Opus 5/4.8/4.7/4.6/4.5/4.1/4/3, Sonnet 5/4.6/4.5/4/3.7/3.5, Haiku 4.5/3.5 (including 200K+ tiered pricing and per-model fast mode rates)
-- **Theming** — Built-in Catppuccin Mocha theme, fully customizable via environment variables
+- **Theming** — Built-in Catppuccin themes (Latte, Frappé, Macchiato, Mocha), fully customizable via environment variables
 
 ## Requirements
 
@@ -64,7 +64,9 @@ Add to `~/.claude/settings.json`:
 
 ### Theme
 
-Set `CC_STATUSLINE_THEME` to use a built-in theme:
+Set `CC_STATUSLINE_THEME` to one of the built-in themes: `catppuccin-latte`, `catppuccin-frappe`,
+`catppuccin-macchiato`, or `catppuccin-mocha`. Any other value, or none, uses the terminal's
+default ANSI colors.
 
 ```sh
 export CC_STATUSLINE_THEME=catppuccin-mocha
@@ -85,6 +87,22 @@ Override individual colors with ANSI escape sequences:
 | `CC_STATUSLINE_BAR_FILLED` | Filled bar character | `█` |
 | `CC_STATUSLINE_BAR_TRANSITION` | Transition bar character | `▓` |
 | `CC_STATUSLINE_BAR_EMPTY` | Empty bar character | `░` |
+
+### Branch and Session Name Length
+
+Set `CC_STATUSLINE_BRANCH_MAX` to the length, in bytes, past which the git branch and session
+name segments are truncated. A longer name keeps its first `N - 1` bytes (backed up to a grapheme
+boundary) followed by `…`, so an ASCII name renders in `N` columns. Values below 4 fall back to
+the default and values above 254 are clamped.
+
+```sh
+export CC_STATUSLINE_BRANCH_MAX=32   # default 24
+```
+
+When `COLUMNS` is set, line 1 is measured and the cap is lowered step by step, then token
+counts, the bar, effort, branch, and session name are dropped in that order, until the line fits.
+A long model or subagent name on a narrow terminal can still exceed the width once nothing is
+left to drop.
 
 ### Bar Width
 
