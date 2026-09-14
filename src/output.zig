@@ -261,14 +261,6 @@ fn parseColumns(val: ?[]const u8) ?u16 {
     return std.fmt.parseInt(u16, s, 10) catch null;
 }
 
-/// Map the `COLUMNS` value to a `Layout`, falling back to the full layout
-/// when unparseable.
-fn parseLayout(val: ?[]const u8) Layout {
-    const cols = parseColumns(val) orelse
-        return .{ .bar_width = default_bar_width, .reset_info = .full };
-    return layoutForColumns(cols);
-}
-
 /// Apply the `CC_STATUSLINE_BAR_WIDTH` override to the `COLUMNS`-derived bar
 /// width. The override can only shrink the bar (`0` hides it) — growing past
 /// the layout width would break the no-wrap budget in `layoutForColumns`.
@@ -295,10 +287,12 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
             .branch_max = env.get("CC_STATUSLINE_BRANCH_MAX"),
         },
     );
-    const layout = parseLayout(env.get("COLUMNS"));
+    // Unparseable COLUMNS leaves the full layout and an unconstrained line 1.
+    const cols = parseColumns(env.get("COLUMNS"));
+    const layout: Layout = if (cols) |c| layoutForColumns(c) else .{ .bar_width = default_bar_width, .reset_info = .full };
     theme.bar_width = resolveBarWidth(layout.bar_width, env.get("CC_STATUSLINE_BAR_WIDTH"));
     theme.reset_info = layout.reset_info;
-    theme.cols = parseColumns(env.get("COLUMNS"));
+    theme.cols = cols;
     theme.show_session = if (env.get("CC_STATUSLINE_SHOW_SESSION")) |v| mem.eql(u8, v, "1") else false;
     theme.show_cache = if (env.get("CC_STATUSLINE_SHOW_CACHE")) |v| mem.eql(u8, v, "1") else false;
     // Opt-out, unlike the SHOW_* flags above: the cost line is on unless "0".
@@ -2207,14 +2201,24 @@ test "layoutForWindows three-window breakpoints" {
     try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, layoutForWindows(58, 3, 5));
 }
 
-test "parseLayout fallback and parsing" {
-    const default: Layout = .{ .bar_width = default_bar_width, .reset_info = .full };
-    try std.testing.expectEqual(default, parseLayout(null)); // COLUMNS unset
-    try std.testing.expectEqual(default, parseLayout("not-a-number"));
-    try std.testing.expectEqual(default, parseLayout("99999")); // overflow u16
-    try std.testing.expectEqual(Layout{ .bar_width = 10, .reset_info = .full }, parseLayout("120"));
-    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .duration_only }, parseLayout("50"));
-    try std.testing.expectEqual(Layout{ .bar_width = 0, .reset_info = .none }, parseLayout("30"));
+test "initTheme derives the layout from COLUMNS, full when unset or unparseable" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    const cases = [_]struct { columns: ?[]const u8, bar_width: u8, reset_info: ResetInfo, cols: ?u16 }{
+        .{ .columns = null, .bar_width = 10, .reset_info = .full, .cols = null },
+        .{ .columns = "not-a-number", .bar_width = 10, .reset_info = .full, .cols = null },
+        .{ .columns = "99999", .bar_width = 10, .reset_info = .full, .cols = null }, // overflow u16
+        .{ .columns = "120", .bar_width = 10, .reset_info = .full, .cols = 120 },
+        .{ .columns = "50", .bar_width = 0, .reset_info = .duration_only, .cols = 50 },
+        .{ .columns = "30", .bar_width = 0, .reset_info = .none, .cols = 30 },
+    };
+    for (cases) |c| {
+        if (c.columns) |v| try env.put("COLUMNS", v);
+        const theme = initTheme(&env);
+        try std.testing.expectEqual(c.bar_width, theme.bar_width);
+        try std.testing.expectEqual(c.reset_info, theme.reset_info);
+        try std.testing.expectEqual(c.cols, theme.cols);
+    }
 }
 
 test "parseColumns" {
