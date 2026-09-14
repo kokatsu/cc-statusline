@@ -7,6 +7,7 @@ const scan = @import("scan.zig");
 const time = @import("time.zig");
 const types = @import("types.zig");
 const ju = @import("json_util.zig");
+const TestTree = @import("test_tree.zig").TestTree;
 
 const StdinInfo = types.StdinInfo;
 const RateLimitWindow = types.RateLimitWindow;
@@ -683,86 +684,62 @@ test "parseStdin invalid json" {
 
 test "getGitBranch finds .git/HEAD in current directory" {
     const io = std.testing.io;
-    const base = "/tmp/cc-test-gitbranch";
-    const git_dir = base ++ "/.git";
-    const head_path = git_dir ++ "/HEAD";
-    Io.Dir.createDirAbsolute(io, base, .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, git_dir, .default_dir) catch {};
-    defer {
-        Io.Dir.deleteFileAbsolute(io, head_path) catch {};
-        Io.Dir.deleteDirAbsolute(io, git_dir) catch {};
-        Io.Dir.deleteDirAbsolute(io, base) catch {};
-    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tree = try TestTree.init(arena.allocator());
+    defer tree.deinit();
+    try tree.tmp.dir.createDirPath(io, ".git");
     {
-        var f = try Io.Dir.createFileAbsolute(io, head_path, .{});
+        var f = try tree.tmp.dir.createFile(io, ".git/HEAD", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "ref: refs/heads/main\n");
     }
     var buf: [256]u8 = undefined;
-    const branch = getGitBranch(io, &buf, base);
+    const branch = getGitBranch(io, &buf, tree.root);
     try std.testing.expect(branch != null);
     try std.testing.expectEqualStrings("main", branch.?);
 }
 
 test "getGitBranch walks up to parent" {
     const io = std.testing.io;
-    const base = "/tmp/cc-test-gitbranch-walk";
-    const git_dir = base ++ "/.git";
-    const head_path = git_dir ++ "/HEAD";
-    const sub_dir = base ++ "/sub";
-    const sub_sub = base ++ "/sub/dir";
-    Io.Dir.createDirAbsolute(io, base, .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, git_dir, .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, sub_dir, .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, sub_sub, .default_dir) catch {};
-    defer {
-        Io.Dir.deleteFileAbsolute(io, head_path) catch {};
-        Io.Dir.deleteDirAbsolute(io, git_dir) catch {};
-        Io.Dir.deleteDirAbsolute(io, sub_sub) catch {};
-        Io.Dir.deleteDirAbsolute(io, sub_dir) catch {};
-        Io.Dir.deleteDirAbsolute(io, base) catch {};
-    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tree = try TestTree.init(arena.allocator());
+    defer tree.deinit();
+    try tree.tmp.dir.createDirPath(io, ".git");
+    try tree.tmp.dir.createDirPath(io, "sub/dir");
     {
-        var f = try Io.Dir.createFileAbsolute(io, head_path, .{});
+        var f = try tree.tmp.dir.createFile(io, ".git/HEAD", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "ref: refs/heads/feature-x\n");
     }
     var buf: [256]u8 = undefined;
-    const branch = getGitBranch(io, &buf, sub_sub);
+    const branch = getGitBranch(io, &buf, try tree.path("sub/dir"));
     try std.testing.expect(branch != null);
     try std.testing.expectEqualStrings("feature-x", branch.?);
 }
 
 test "getGitBranch follows a linked worktree's .git pointer file" {
     const io = std.testing.io;
-    const base = "/tmp/cc-test-gitbranch-worktree";
-    const gitdir = base ++ "/main/.git/worktrees/wt";
-    const wt = base ++ "/wt";
-    Io.Dir.createDirAbsolute(io, base, .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, base ++ "/main", .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, base ++ "/main/.git", .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, base ++ "/main/.git/worktrees", .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, gitdir, .default_dir) catch {};
-    Io.Dir.createDirAbsolute(io, wt, .default_dir) catch {};
-    defer {
-        Io.Dir.deleteFileAbsolute(io, gitdir ++ "/HEAD") catch {};
-        Io.Dir.deleteFileAbsolute(io, wt ++ "/.git") catch {};
-        Io.Dir.deleteDirAbsolute(io, wt) catch {};
-        Io.Dir.deleteDirAbsolute(io, gitdir) catch {};
-        Io.Dir.deleteDirAbsolute(io, base ++ "/main/.git/worktrees") catch {};
-        Io.Dir.deleteDirAbsolute(io, base ++ "/main/.git") catch {};
-        Io.Dir.deleteDirAbsolute(io, base ++ "/main") catch {};
-        Io.Dir.deleteDirAbsolute(io, base) catch {};
-    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tree = try TestTree.init(arena.allocator());
+    defer tree.deinit();
+    const gitdir = try tree.path("main/.git/worktrees/wt");
+    const wt = try tree.path("wt");
+    try tree.tmp.dir.createDirPath(io, "main/.git/worktrees/wt");
+    try tree.tmp.dir.createDirPath(io, "wt");
     {
-        var f = try Io.Dir.createFileAbsolute(io, gitdir ++ "/HEAD", .{});
+        var f = try tree.tmp.dir.createFile(io, "main/.git/worktrees/wt/HEAD", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "ref: refs/heads/feature-wt\n");
     }
     {
-        var f = try Io.Dir.createFileAbsolute(io, wt ++ "/.git", .{});
+        var f = try tree.tmp.dir.createFile(io, "wt/.git", .{});
         defer f.close(io);
-        try f.writeStreamingAll(io, "gitdir: " ++ gitdir ++ "\n");
+        try f.writeStreamingAll(io, "gitdir: ");
+        try f.writeStreamingAll(io, gitdir);
+        try f.writeStreamingAll(io, "\n");
     }
     var buf: [256]u8 = undefined;
     const branch = getGitBranch(io, &buf, wt);
@@ -771,7 +748,7 @@ test "getGitBranch follows a linked worktree's .git pointer file" {
 
     // worktree.useRelativePaths=true writes the pointer relative to the worktree.
     {
-        var f = try Io.Dir.createFileAbsolute(io, wt ++ "/.git", .{});
+        var f = try tree.tmp.dir.createFile(io, "wt/.git", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, "gitdir: ../main/.git/worktrees/wt\n");
     }
@@ -782,21 +759,24 @@ test "getGitBranch follows a linked worktree's .git pointer file" {
 
 test "readGitHead accepts a HEAD that exactly fills the buffer and rejects a longer one" {
     const io = std.testing.io;
-    const path = "/tmp/cc-test-githead-exact";
-    defer Io.Dir.deleteFileAbsolute(io, path) catch {};
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var tree = try TestTree.init(arena.allocator());
+    defer tree.deinit();
+    const path = try tree.path("HEAD");
     const prefix = "ref: refs/heads/";
     // prefix (16) + 239 + "\n" = 256 bytes, the buffer size exactly.
     const exact = prefix ++ ("b" ** 239) ++ "\n";
     comptime std.debug.assert(exact.len == 256);
     {
-        var f = try Io.Dir.createFileAbsolute(io, path, .{});
+        var f = try tree.tmp.dir.createFile(io, "HEAD", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, exact);
     }
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("b" ** 239, readGitHead(io, &buf, path).?);
     {
-        var f = try Io.Dir.createFileAbsolute(io, path, .{});
+        var f = try tree.tmp.dir.createFile(io, "HEAD", .{});
         defer f.close(io);
         try f.writeStreamingAll(io, prefix ++ ("b" ** 240) ++ "\n");
     }
@@ -804,12 +784,13 @@ test "readGitHead accepts a HEAD that exactly fills the buffer and rejects a lon
 }
 
 test "getGitBranch returns null when no .git/HEAD" {
+    // Not a TestTree: those live under .zig-cache inside this repository,
+    // whose own .git/HEAD the walk-up would find. /tmp and / have none.
     const io = std.testing.io;
     const base = "/tmp/cc-test-gitbranch-empty";
     Io.Dir.createDirAbsolute(io, base, .default_dir) catch {};
     defer Io.Dir.deleteDirAbsolute(io, base) catch {};
     var buf: [256]u8 = undefined;
-    // /tmp has no .git/HEAD, neither does /
     try std.testing.expectEqual(@as(?[]const u8, null), getGitBranch(io, &buf, base));
 }
 

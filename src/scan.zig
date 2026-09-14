@@ -4,6 +4,7 @@ const Io = std.Io;
 const pricing = @import("pricing.zig");
 const time = @import("time.zig");
 const types = @import("types.zig");
+const TestTree = @import("test_tree.zig").TestTree;
 // Module-level io handle: cc-statusline is single-threaded and scanning touches
 // dozens of callsites, so threading io through every helper balloons the diff.
 var g_io: Io = undefined;
@@ -1837,37 +1838,32 @@ test "cacheTmpPath is unique per call and keeps the cache path as prefix" {
     g_io = std.testing.io;
     var a: [std.fs.max_path_bytes]u8 = undefined;
     var b: [std.fs.max_path_bytes]u8 = undefined;
-    const pa = cacheTmpPath(&a, "/tmp/cc-test-cache.bin").?;
-    const pb = cacheTmpPath(&b, "/tmp/cc-test-cache.bin").?;
-    try std.testing.expect(mem.startsWith(u8, pa, "/tmp/cc-test-cache.bin."));
+    const pa = cacheTmpPath(&a, "/x/statusline-cache.bin").?;
+    const pb = cacheTmpPath(&b, "/x/statusline-cache.bin").?;
+    try std.testing.expect(mem.startsWith(u8, pa, "/x/statusline-cache.bin."));
     try std.testing.expect(mem.endsWith(u8, pa, ".tmp"));
     try std.testing.expect(!mem.eql(u8, pa, pb));
 }
 
 test "writeCache leaves only the renamed cache behind" {
     g_io = std.testing.io;
-    const dir = "/tmp/cc-test-writecache";
-    const cp = dir ++ "/" ++ cache_name;
-    Io.Dir.createDirAbsolute(std.testing.io, dir, .default_dir) catch {};
-    defer {
-        Io.Dir.deleteFileAbsolute(std.testing.io, cp) catch {};
-        Io.Dir.deleteDirAbsolute(std.testing.io, dir) catch {};
-    }
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const cp = try tree.path(cache_name);
     writeCache(.{ .today_cost = 1.0 }, &.{}, 100, 100, 0, cp);
 
-    var d = try Io.Dir.openDirAbsolute(std.testing.io, dir, .{ .iterate = true });
-    defer d.close(std.testing.io);
     var count: usize = 0;
-    var it = d.iterate();
+    var it = tree.tmp.dir.iterate();
     while (try it.next(std.testing.io)) |entry| {
         try std.testing.expectEqualStrings(cache_name, entry.name);
         count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), count);
 
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const cached = readCache(arena.allocator(), 0, cp) orelse return error.TestUnexpectedResult;
+    const cached = readCache(alloc, 0, cp) orelse return error.TestUnexpectedResult;
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), cached.scan.today_cost, 1e-10);
 }
 
@@ -2039,11 +2035,12 @@ test "parseJsonlContent model fallback to unknown" {
 }
 
 test "parseJsonlReader recovers lines exceeding the reader buffer" {
-    const path = "/tmp/cc-test-long-line.jsonl";
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("long-line.jsonl");
 
     const padding = try alloc.alloc(u8, 4096);
     @memset(padding, 'x');
@@ -2054,7 +2051,6 @@ test "parseJsonlReader recovers lines exceeding the reader buffer" {
     );
 
     try createTmpFile(path, line);
-    defer removeTmpFile(path);
 
     var f = try Io.Dir.openFileAbsolute(std.testing.io, path, .{});
     defer f.close(std.testing.io);
@@ -2081,28 +2077,22 @@ fn createTmpFile(path: []const u8, content: []const u8) !void {
     try f.writeStreamingAll(std.testing.io, content);
 }
 
-fn removeTmpFile(path: []const u8) void {
-    Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
-}
-
-const test_cache_path = "/tmp/cc-test-cache.bin";
-
 fn statFileSize(path: []const u8) i64 {
     const stat = Io.Dir.cwd().statFile(std.testing.io, path, .{}) catch return 0;
     return @intCast(stat.size);
 }
 
 test "diffScan no files changed returns cached result" {
-    const path = "/tmp/cc-test-diffscan-nochange.jsonl";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("nochange.jsonl");
     const content =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":100,"output_tokens":50}}}
     ;
     try createTmpFile(path, content);
-    defer removeTmpFile(path);
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
 
     const file_size = statFileSize(path);
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
@@ -2119,20 +2109,19 @@ test "diffScan no files changed returns cached result" {
         .day_start_ms = day_start_ms,
     };
 
-    defer removeTmpFile(test_cache_path);
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expectApproxEqAbs(@as(f64, 5.0), result.?.today_cost, 1e-10);
 }
 
 test "diffScan file shrank returns null" {
-    const path = "/tmp/cc-test-diffscan-shrunk.jsonl";
-    try createTmpFile(path, "small");
-    defer removeTmpFile(path);
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("shrunk.jsonl");
+    try createTmpFile(path, "small");
 
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
     const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
@@ -2148,13 +2137,15 @@ test "diffScan file shrank returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin")));
 }
 
 test "diffScan file disappeared returns null" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
 
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
     const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
@@ -2163,24 +2154,24 @@ test "diffScan file disappeared returns null" {
     const cached = CacheResult{
         .scan = .{ .today_cost = 5.0 },
         .files = &[_]CachedFileEntry{
-            .{ .path = "/tmp/cc-test-diffscan-nonexistent-xyz.jsonl", .file_size = 100, .per_file_cost = 5.0, .parsed_size = 100 },
+            .{ .path = try tree.path("nonexistent.jsonl"), .file_size = 100, .per_file_cost = 5.0, .parsed_size = 100 },
         },
         .write_time_s = now_s - 10,
         .last_full_scan_s = now_s - 100,
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin")));
 }
 
 test "diffScan resets_at changed returns null" {
-    const path = "/tmp/cc-test-diffscan-reset.jsonl";
-    try createTmpFile(path, "data");
-    defer removeTmpFile(path);
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("reset.jsonl");
+    try createTmpFile(path, "data");
 
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
     const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
@@ -2200,11 +2191,16 @@ test "diffScan resets_at changed returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, test_cache_path));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, try tree.path("cache.bin")));
 }
 
 test "diffScan file grew recalculates cost" {
-    const path = "/tmp/cc-test-diffscan-grew.jsonl";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("grew.jsonl");
     const old_content = "old data padding\n";
     const new_line =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
@@ -2212,11 +2208,6 @@ test "diffScan file grew recalculates cost" {
     var full_buf: [512]u8 = undefined;
     const full_content = std.fmt.bufPrint(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
     try createTmpFile(path, full_content);
-    defer removeTmpFile(path);
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
 
     const old_size: i64 = @intCast(old_content.len);
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
@@ -2233,22 +2224,21 @@ test "diffScan file grew recalculates cost" {
         .day_start_ms = day_start_ms,
     };
 
-    defer removeTmpFile(test_cache_path);
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.today_cost > 1.0);
 }
 
 test "diffScan total_diff_cost zero preserves cached block" {
-    const path = "/tmp/cc-test-diffscan-nodiff.jsonl";
-    const old_content = "some old data\n";
-    const full_content = old_content ++ "not a valid jsonl line with input_tokens\n";
-    try createTmpFile(path, full_content);
-    defer removeTmpFile(path);
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("nodiff.jsonl");
+    const old_content = "some old data\n";
+    const full_content = old_content ++ "not a valid jsonl line with input_tokens\n";
+    try createTmpFile(path, full_content);
 
     const old_size: i64 = @intCast(old_content.len);
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
@@ -2266,8 +2256,7 @@ test "diffScan total_diff_cost zero preserves cached block" {
         .day_start_ms = day_start_ms,
     };
 
-    defer removeTmpFile(test_cache_path);
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.block != null);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.?.block.?.cost, 1e-10);
@@ -2279,7 +2268,12 @@ test "diffScan falls through to fullScan when cached block is null and new entri
     // caches block=null. Once a new entry is appended to the transcript, diffScan
     // must not silently keep block=null — return null so the caller re-runs fullScan
     // and can re-establish the block from the new entry.
-    const path = "/tmp/cc-test-diffscan-nullblock-resets.jsonl";
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("nullblock-resets.jsonl");
     const old_content = "pre-window placeholder\n";
     const new_line =
         \\{"timestamp":"2025-06-15T11:30:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
@@ -2287,11 +2281,6 @@ test "diffScan falls through to fullScan when cached block is null and new entri
     var full_buf: [512]u8 = undefined;
     const full_content = std.fmt.bufPrint(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
     try createTmpFile(path, full_content);
-    defer removeTmpFile(path);
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
 
     const old_size: i64 = @intCast(old_content.len);
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
@@ -2313,7 +2302,7 @@ test "diffScan falls through to fullScan when cached block is null and new entri
 
     try std.testing.expectEqual(
         @as(?ScanResult, null),
-        diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, test_cache_path),
+        diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, try tree.path("cache.bin")),
     );
 }
 
@@ -2321,13 +2310,13 @@ test "diffScan keeps cached null block when no files changed (no false fullScan)
     // Guard against over-eager fallback: when the window is empty AND nothing changed,
     // diffScan should still return the cached result (block=null) rather than triggering
     // a useless fullScan. Only new entries warrant falling through.
-    const path = "/tmp/cc-test-diffscan-nullblock-unchanged.jsonl";
-    try createTmpFile(path, "placeholder\n");
-    defer removeTmpFile(path);
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const path = try tree.path("nullblock-unchanged.jsonl");
+    try createTmpFile(path, "placeholder\n");
 
     const file_size = statFileSize(path);
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
@@ -2345,8 +2334,7 @@ test "diffScan keeps cached null block when no files changed (no false fullScan)
         .day_start_ms = day_start_ms,
     };
 
-    defer removeTmpFile(test_cache_path);
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, test_cache_path);
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(?BlockInfo, null), result.?.block);
 }
@@ -2356,14 +2344,15 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     // its finalized line is only appended afterwards. The next diff scan must
     // replace the old contribution instead of adding the finalized line on
     // top (a double count that would persist until the next fullScan).
-    const projects = "/tmp/cc-test-tail-projects";
-    const proj_dir = projects ++ "/proj";
-    const file_path = proj_dir ++ "/session.jsonl";
-    const cp = "/tmp/cc-test-tail-cache.bin";
-
-    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
-    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
-    defer removeTmpFile(cp);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const file_path = try tree.path("projects/proj/session.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
 
     const placeholder =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":6}},"requestId":"req_001"}
@@ -2374,10 +2363,6 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     const final2 =
         \\{"timestamp":"2025-06-15T10:00:09Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":2000}},"requestId":"req_001"}
     ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
 
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
     const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
@@ -2414,18 +2399,15 @@ test "diffScan replaces snapshot even when many messages interleave before final
     // slot in place, so the tail must select by recency (timestamp), not by
     // slot position — otherwise the message drops out of the tail and the
     // next diff scan double-counts its following snapshot.
-    const projects = "/tmp/cc-test-tail-interleave-projects";
-    const proj_dir = projects ++ "/proj";
-    const file_path = proj_dir ++ "/session.jsonl";
-    const cp = "/tmp/cc-test-tail-interleave-cache.bin";
-
-    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
-    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
-    defer removeTmpFile(cp);
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const file_path = try tree.path("projects/proj/session.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
 
     var content: std.Io.Writer.Allocating = .init(alloc);
     // Placeholder snapshot of msg_x, then tail_max + 1 unique fillers, then
@@ -2474,18 +2456,15 @@ test "diffScan falls back to fullScan when appended lines replay old history" {
     // with their original (old) timestamps — arbitrarily far beyond any
     // bounded tail. diffScan must detect the timestamp regression and return
     // null so the caller re-runs fullScan, whose dedup collapses the replay.
-    const projects = "/tmp/cc-test-replay-projects";
-    const proj_dir = projects ++ "/proj";
-    const file_path = proj_dir ++ "/session.jsonl";
-    const cp = "/tmp/cc-test-replay-cache.bin";
-
-    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
-    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
-    defer removeTmpFile(cp);
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const file_path = try tree.path("projects/proj/session.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
 
     const m1 =
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_001","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":500}},"requestId":"req_001"}
@@ -3174,14 +3153,15 @@ test "parseJsonlContent streaming placeholder is replaced by the advisor-carryin
 }
 
 test "diffScan replaces the placeholder with the advisor-inclusive final line" {
-    const projects = "/tmp/cc-test-advisor-projects";
-    const proj_dir = projects ++ "/proj";
-    const file_path = proj_dir ++ "/session.jsonl";
-    const cp = "/tmp/cc-test-advisor-cache.bin";
-
-    try Io.Dir.cwd().createDirPath(std.testing.io, proj_dir);
-    defer Io.Dir.cwd().deleteTree(std.testing.io, projects) catch {};
-    defer removeTmpFile(cp);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const file_path = try tree.path("projects/proj/session.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
 
     const placeholder =
         \\{"timestamp":"2025-06-15T10:00:00Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":6}}}
@@ -3189,10 +3169,6 @@ test "diffScan replaces the placeholder with the advisor-inclusive final line" {
     const final =
         \\{"timestamp":"2025-06-15T10:00:05Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-opus-5","usage":{"input_tokens":100,"output_tokens":751,"iterations":[{"input_tokens":100,"output_tokens":751,"type":"message"},{"input_tokens":90249,"output_tokens":15417,"type":"advisor_message","model":"claude-fable-5"}]}}}
     ;
-
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
 
     const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
     const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
