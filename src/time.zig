@@ -18,12 +18,12 @@ pub fn parseIso8601ToMs(s: []const u8) ?i64 {
     if (s.len < 19) return null;
     if (s[4] != '-' or s[7] != '-' or (s[10] != 'T' and s[10] != 't') or s[13] != ':' or s[16] != ':') return null;
 
-    const year = parseDecimal(s[0..4]) orelse return null;
-    const month = parseDecimal(s[5..7]) orelse return null;
-    const day = parseDecimal(s[8..10]) orelse return null;
-    const hour = parseDecimal(s[11..13]) orelse return null;
-    const minute = parseDecimal(s[14..16]) orelse return null;
-    const second = parseDecimal(s[17..19]) orelse return null;
+    const year = parseDigits(s[0..4]) orelse return null;
+    const month = parseDigits(s[5..7]) orelse return null;
+    const day = parseDigits(s[8..10]) orelse return null;
+    const hour = parseDigits(s[11..13]) orelse return null;
+    const minute = parseDigits(s[14..16]) orelse return null;
+    const second = parseDigits(s[17..19]) orelse return null;
 
     var millis: i64 = 0;
     if (s.len > 19 and s[19] == '.') {
@@ -71,8 +71,16 @@ fn parseIso8601FastCanonical(s: []const u8) ?i64 {
     return (days * 86400 + h * 3600 + mi * 60 + se) * 1000 + ms;
 }
 
-fn parseDecimal(s: []const u8) ?i64 {
-    return std.fmt.parseInt(i64, s, 10) catch null;
+/// Unsigned decimal from a fixed-width field. Unlike `std.fmt.parseInt`,
+/// a leading `+` or `-` is rejected: the fields feed `@intCast` to `u8`,
+/// and a signed month or day would be illegal behavior there.
+fn parseDigits(s: []const u8) ?i64 {
+    var v: i64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        v = v * 10 + (c - '0');
+    }
+    return v;
 }
 
 pub fn computeLocalDayStartMs(now_ms: i64, utc_offset_s: i32) i64 {
@@ -344,12 +352,22 @@ test "parseIso8601ToMs" {
     try std.testing.expectEqual(@as(?i64, null), parseIso8601ToMs(""));
 }
 
-test "parseDecimal overflow" {
-    try std.testing.expectEqual(@as(?i64, 12345), parseDecimal("12345"));
-    try std.testing.expectEqual(@as(?i64, 0), parseDecimal("0"));
-    try std.testing.expectEqual(@as(?i64, null), parseDecimal("99999999999999999999"));
-    try std.testing.expectEqual(@as(?i64, null), parseDecimal("12a3"));
-    try std.testing.expectEqual(@as(?i64, null), parseDecimal(""));
+test "parseDigits accepts only ASCII digits" {
+    try std.testing.expectEqual(@as(?i64, 12345), parseDigits("12345"));
+    try std.testing.expectEqual(@as(?i64, 0), parseDigits("0"));
+    try std.testing.expectEqual(@as(?i64, 0), parseDigits(""));
+    try std.testing.expectEqual(@as(?i64, null), parseDigits("12a3"));
+    try std.testing.expectEqual(@as(?i64, null), parseDigits("-1"));
+    try std.testing.expectEqual(@as(?i64, null), parseDigits("+1"));
+}
+
+test "parseIso8601ToMs slow path rejects signed fields" {
+    // std.fmt.parseInt accepts a leading sign, so these once reached
+    // daysFromCivil with month = -1 (Debug panic, ReleaseFast UB).
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601ToMs("2025--1-15T10:30:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601ToMs("2025-01-+5T10:30:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601ToMs("2025-01-15T-1:30:00Z"));
+    try std.testing.expectEqual(@as(?i64, null), parseIso8601ToMs("+025-01-15T10:30:00Z"));
 }
 
 test "floorToHourMs" {
