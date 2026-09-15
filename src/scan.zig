@@ -47,7 +47,7 @@ const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
 
 const cache_magic = [4]u8{ 'C', 'C', 'S', 'L' };
-const cache_ver: u32 = 8;
+const cache_ver: u32 = 9;
 const file_list_ttl_s: i64 = 300;
 // Actual caches are ~tens of KB; cap at 1 MiB to fail fast on corruption.
 const cache_max_bytes: usize = 1 * 1024 * 1024;
@@ -121,6 +121,11 @@ const CacheResult = struct {
     write_time_s: i64,
     last_full_scan_s: i64,
     day_start_ms: i64,
+    /// The 5-hour reset this cache's block was computed from, null when it
+    /// came from the gap heuristic instead. Kept apart from `scan.block`
+    /// because a window nothing has been spent in yields a null block, and
+    /// "no entries yet" must not read as "window unknown".
+    window_end_ms: ?i64 = null,
 };
 
 // ============================================================
@@ -991,6 +996,8 @@ const cache_header_size: usize =
     @sizeOf(f64) + // block_cost
     @sizeOf(f64) + // block_burn_rate
     @sizeOf(i64) + // day_start_ms
+    1 + // has_window
+    @sizeOf(i64) + // window_end_ms
     @sizeOf(u32); // file_count
 
 fn readVal(comptime T: type, data: []const u8, pos: *usize) T {
@@ -1004,7 +1011,7 @@ fn readVal(comptime T: type, data: []const u8, pos: *usize) T {
 /// `files[i].path` slices borrow from `content`; callers must keep
 /// `content` alive for as long as the result is used, and must not free
 /// `entry.path`.
-fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_ms: i64) ?CacheResult {
+fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8) ?CacheResult {
     if (content.len < cache_header_size) return null;
 
     if (!mem.eql(u8, content[0..4], &cache_magic)) return null;
@@ -1021,9 +1028,10 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_
     const block_cost = readVal(f64, content, &pos);
     const block_burn_rate = readVal(f64, content, &pos);
     const hdr_day_start_ms = readVal(i64, content, &pos);
+    const has_window = content[pos];
+    pos += 1;
+    const window_end_ms = readVal(i64, content, &pos);
     const file_count = readVal(u32, content, &pos);
-
-    if (hdr_day_start_ms != day_start_ms) return null;
 
     var scan = ScanResult{
         .today_cost = today_cost,
@@ -1081,16 +1089,17 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8, day_start_
         .write_time_s = write_time_s,
         .last_full_scan_s = last_full_scan_s,
         .day_start_ms = hdr_day_start_ms,
+        .window_end_ms = if (has_window != 0) window_end_ms else null,
     };
 }
 
-fn readCache(allocator: std.mem.Allocator, day_start_ms: i64, cp: []const u8) ?CacheResult {
+fn readCache(allocator: std.mem.Allocator, cp: []const u8) ?CacheResult {
     var f = Io.Dir.openFileAbsolute(g_io, cp, .{}) catch return null;
     defer f.close(g_io);
     var rbuf: [4096]u8 = undefined;
     var reader = f.readerStreaming(g_io, &rbuf);
     const content = reader.interface.allocRemaining(allocator, .limited(cache_max_bytes)) catch return null;
-    return parseCacheBytes(allocator, content, day_start_ms);
+    return parseCacheBytes(allocator, content);
 }
 
 fn writeVal(w: anytype, value: anytype) !void {
@@ -1101,7 +1110,7 @@ fn writeVal(w: anytype, value: anytype) !void {
     try w.writeAll(&buf);
 }
 
-fn serializeCacheBytes(w: anytype, result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64) !void {
+fn serializeCacheBytes(w: anytype, result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, window_end_ms: ?i64) !void {
     try w.writeAll(&cache_magic);
     try writeVal(w, cache_ver);
     try writeVal(w, now_s);
@@ -1113,6 +1122,8 @@ fn serializeCacheBytes(w: anytype, result: ScanResult, files: []const CachedFile
     try writeVal(w, if (result.block) |b| b.cost else @as(f64, 0));
     try writeVal(w, if (result.block) |b| b.burn_rate_per_hr else @as(f64, 0));
     try writeVal(w, day_start_ms);
+    try w.writeAll(&[_]u8{if (window_end_ms != null) 1 else 0});
+    try writeVal(w, window_end_ms orelse @as(i64, 0));
     try writeVal(w, @as(u32, @intCast(files.len)));
 
     for (files) |entry| {
@@ -1155,7 +1166,7 @@ fn cacheTmpPath(buf: []u8, cp: []const u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}.{x}.tmp", .{ cp, ns }) catch null;
 }
 
-fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, cp: []const u8) void {
+fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, window_end_ms: ?i64, cp: []const u8) void {
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_path = cacheTmpPath(&tmp_buf, cp) orelse return;
     var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{ .exclusive = true }) catch |err| {
@@ -1166,7 +1177,7 @@ fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, la
     var wbuf: [8192]u8 = undefined;
     var writer = f.writerStreaming(g_io, &wbuf);
     const written = blk: {
-        serializeCacheBytes(&writer.interface, result, files, now_s, last_full_scan_s, day_start_ms) catch break :blk false;
+        serializeCacheBytes(&writer.interface, result, files, now_s, last_full_scan_s, day_start_ms, window_end_ms) catch break :blk false;
         writer.interface.flush() catch break :blk false;
         break :blk true;
     };
@@ -1297,10 +1308,33 @@ pub fn benchFullScanProfiled(
 
     ts = Io.Clock.awake.now(io);
     const cf = cache_files.toOwnedSlice(allocator) catch &.{};
-    writeCache(result, cf, now_s, now_s, day_start_ms, cp);
+    writeCache(result, cf, now_s, now_s, day_start_ms, null, cp);
     timings[@intFromEnum(Phase.write_cache)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
 
     return result;
+}
+
+/// Which 5-hour window the next scan runs against, and whether the cached
+/// result still belongs to that window.
+const WindowPlan = struct {
+    reset_ms: ?i64,
+    reuse_cache: bool,
+};
+
+/// Only a call carrying a session JSON knows the real reset, so the one any
+/// earlier call recorded is what a stdin-less caller scans by. Without it the
+/// block falls back to the gap heuristic, which anchors on activity rather than
+/// on Claude Code's reset hour and so reads as a sudden jump in the 5h cost.
+fn planWindow(cached_window_ms: ?i64, resets_at_ms: ?i64, now_ms: i64) WindowPlan {
+    const cached_window = cached_window_ms orelse return .{
+        .reset_ms = resets_at_ms,
+        .reuse_cache = resets_at_ms == null,
+    };
+    const live = cached_window > now_ms;
+    return .{
+        .reset_ms = resets_at_ms orelse if (live) cached_window else null,
+        .reuse_cache = live and (resets_at_ms orelse cached_window) == cached_window,
+    };
 }
 
 pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64) ?ScanResult {
@@ -1310,32 +1344,32 @@ pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: s
     const cp = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, cache_name }) catch return null;
     const now_s = @divFloor(now_ms, @as(i64, 1000));
 
+    var reset_ms = resets_at_ms;
+
     // Try cache — TTL check before any I/O
-    if (readCache(allocator, day_start_ms, cp)) |cached| {
-        if (now_s - cached.write_time_s <= cache_ttl_s) {
-            return cached.scan;
-        }
-        // TTL expired, but file list is still fresh — try stat-only diff
-        if (now_s - cached.last_full_scan_s <= file_list_ttl_s and cached.files.len > 0) {
-            if (diffScan(allocator, cached, now_ms, now_s, day_start_ms, resets_at_ms, cp)) |result| {
-                return result;
+    if (readCache(allocator, cp)) |cached| {
+        const plan = planWindow(cached.window_end_ms, resets_at_ms, now_ms);
+        reset_ms = plan.reset_ms;
+
+        if (plan.reuse_cache and cached.day_start_ms == day_start_ms) {
+            if (now_s - cached.write_time_s <= cache_ttl_s) {
+                return cached.scan;
+            }
+            // TTL expired, but file list is still fresh — try stat-only diff
+            if (now_s - cached.last_full_scan_s <= file_list_ttl_s and cached.files.len > 0) {
+                if (diffScan(allocator, cached, now_ms, now_s, day_start_ms, cp)) |result| {
+                    return result;
+                }
             }
         }
     }
 
-    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, resets_at_ms, cp);
+    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, reset_ms, cp);
 }
 
 /// Stat-only diff scan: check cached files for size changes, parse only new bytes.
 /// Returns null if any file shrank/disappeared (caller should fall back to full scan).
-fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64, cp: []const u8) ?ScanResult {
-    // If resets_at changed since cache was written, the block window shifted — need full rescan
-    if (resets_at_ms) |reset_ms| {
-        if (cached.scan.block) |existing_block| {
-            if (existing_block.end_ms != reset_ms) return null;
-        }
-    }
-
+fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_s: i64, day_start_ms: i64, cp: []const u8) ?ScanResult {
     var changed: std.StringHashMapUnmanaged(CachedFileEntry) = .empty;
     var any_shrunk = false;
 
@@ -1361,15 +1395,15 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
     if (any_shrunk) return null;
 
     if (changed.count() == 0) {
-        writeCache(cached.scan, cached.files, now_s, cached.last_full_scan_s, day_start_ms, cp);
+        writeCache(cached.scan, cached.files, now_s, cached.last_full_scan_s, day_start_ms, cached.window_end_ms, cp);
         return cached.scan;
     }
 
-    // If the cached block is null but a resets_at window is active, diffScan cannot
+    // If the cached block is null but a window is active, diffScan cannot
     // synthesize a fresh block from per-file diffs alone — fall through to fullScan
     // so the new entries can re-establish it. Without this, block stays null until
     // file_list_ttl_s (5 min) elapses, manifesting as "5h cost shows up late."
-    if (resets_at_ms != null and cached.scan.block == null) return null;
+    if (cached.window_end_ms != null and cached.scan.block == null) return null;
 
     var block_diff_cost: f64 = 0;
     var new_files: std.ArrayList(CachedFileEntry) = .empty;
@@ -1470,7 +1504,7 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
         .block = block,
     };
     const new_file_entries = new_files.toOwnedSlice(allocator) catch cached.files;
-    writeCache(result, new_file_entries, now_s, cached.last_full_scan_s, day_start_ms, cp);
+    writeCache(result, new_file_entries, now_s, cached.last_full_scan_s, day_start_ms, cached.window_end_ms, cp);
     return result;
 }
 
@@ -1528,7 +1562,7 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
         .block = computeBlock(all_entries.items, now_ms, resets_at_ms),
     };
     const cf = cache_files.toOwnedSlice(allocator) catch &.{};
-    writeCache(result, cf, now_s, now_s, day_start_ms, cp);
+    writeCache(result, cf, now_s, now_s, day_start_ms, resets_at_ms, cp);
     return result;
 }
 
@@ -1713,10 +1747,11 @@ test "cache roundtrip with block" {
     const now_s: i64 = 1700000000;
     const last_full_scan_s: i64 = 1699999900;
     const day_start_ms: i64 = 1699920000000;
+    const window_end_ms: i64 = 19000000;
 
-    try serializeCacheBytes(&aw.writer, scan, &files, now_s, last_full_scan_s, day_start_ms);
+    try serializeCacheBytes(&aw.writer, scan, &files, now_s, last_full_scan_s, day_start_ms, window_end_ms);
 
-    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered(), day_start_ms) orelse
+    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered()) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
     defer for (result.files) |f| std.testing.allocator.free(f.tail);
@@ -1724,6 +1759,7 @@ test "cache roundtrip with block" {
     try std.testing.expectEqual(now_s, result.write_time_s);
     try std.testing.expectEqual(last_full_scan_s, result.last_full_scan_s);
     try std.testing.expectEqual(day_start_ms, result.day_start_ms);
+    try std.testing.expectEqual(@as(?i64, window_end_ms), result.window_end_ms);
     try std.testing.expectApproxEqAbs(@as(f64, 12.345), result.scan.today_cost, 1e-10);
 
     const block = result.scan.block orelse return error.TestUnexpectedResult;
@@ -1761,28 +1797,33 @@ test "cache roundtrip without block" {
     const files = [_]CachedFileEntry{};
     const day_start_ms: i64 = 1699920000000;
 
-    try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms);
+    try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms, null);
 
-    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered(), day_start_ms) orelse
+    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered()) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
 
     try std.testing.expectApproxEqAbs(@as(f64, 0.50), result.scan.today_cost, 1e-10);
     try std.testing.expectEqual(@as(?BlockInfo, null), result.scan.block);
+    try std.testing.expectEqual(@as(?i64, null), result.window_end_ms);
     try std.testing.expectEqual(@as(usize, 0), result.files.len);
 }
 
-test "cache day boundary invalidation" {
+test "cache keeps its day and window so a stale day still yields the window" {
     const Writer = std.Io.Writer;
     var aw: Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
 
     const day_start_ms: i64 = 1699920000000;
-    try serializeCacheBytes(&aw.writer, ScanResult{}, &.{}, 100, 100, day_start_ms);
+    const window_end_ms: i64 = day_start_ms + 26 * 3600 * 1000;
+    try serializeCacheBytes(&aw.writer, ScanResult{}, &.{}, 100, 100, day_start_ms, window_end_ms);
 
-    // Different day_start_ms should return null
-    const different_day: i64 = day_start_ms + 86400 * 1000;
-    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, aw.writer.buffered(), different_day));
+    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered()) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(result.files);
+
+    try std.testing.expectEqual(day_start_ms, result.day_start_ms);
+    try std.testing.expectEqual(@as(?i64, window_end_ms), result.window_end_ms);
 }
 
 test "cacheTmpPath is unique per call and keeps the cache path as prefix" {
@@ -1804,7 +1845,7 @@ test "writeCache leaves only the renamed cache behind" {
     var tree = try TestTree.init(alloc);
     defer tree.deinit();
     const cp = try tree.path(cache_name);
-    writeCache(.{ .today_cost = 1.0 }, &.{}, 100, 100, 0, cp);
+    writeCache(.{ .today_cost = 1.0 }, &.{}, 100, 100, 0, null, cp);
 
     var count: usize = 0;
     var it = tree.tmp.dir.iterate();
@@ -1814,19 +1855,19 @@ test "writeCache leaves only the renamed cache behind" {
     }
     try std.testing.expectEqual(@as(usize, 1), count);
 
-    const cached = readCache(alloc, 0, cp) orelse return error.TestUnexpectedResult;
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), cached.scan.today_cost, 1e-10);
 }
 
 test "cache invalid magic" {
     var data: [cache_header_size]u8 = .{0} ** cache_header_size;
     @memcpy(data[0..4], "NOPE");
-    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data, 0));
+    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data));
 }
 
 test "cache too short" {
     const data = [_]u8{ 'C', 'C', 'S', 'L' };
-    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data, 0));
+    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data));
 }
 
 test "cache wrong version" {
@@ -1834,7 +1875,7 @@ test "cache wrong version" {
     @memcpy(data[0..4], &cache_magic);
     // Write a different version (cache_ver + 1)
     mem.writeInt(u32, data[4..8], cache_ver + 1, .little);
-    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data, 0));
+    try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data));
 }
 
 test "computeBlockFromWindow entries within window" {
@@ -2056,7 +2097,7 @@ test "diffScan no files changed returns cached result" {
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin"));
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expectApproxEqAbs(@as(f64, 5.0), result.?.today_cost, 1e-10);
 }
@@ -2084,7 +2125,7 @@ test "diffScan file shrank returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin")));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")));
 }
 
 test "diffScan file disappeared returns null" {
@@ -2108,37 +2149,61 @@ test "diffScan file disappeared returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin")));
+    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")));
 }
 
-test "diffScan resets_at changed returns null" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var tree = try TestTree.init(alloc);
-    defer tree.deinit();
-    const path = try tree.path("reset.jsonl");
-    try createTmpFile(path, "data");
+test "planWindow carries a live window to a caller without one" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const window = now_ms + 3600 * 1000;
+    const plan = planWindow(window, null, now_ms);
+    try std.testing.expectEqual(@as(?i64, window), plan.reset_ms);
+    try std.testing.expect(plan.reuse_cache);
+}
 
-    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
-    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
-    const now_s = @divFloor(now_ms, @as(i64, 1000));
-    const resets_at_ms: i64 = now_ms + 3 * 3600 * 1000;
+test "planWindow keeps the cache when the caller's reset agrees" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const window = now_ms + 3600 * 1000;
+    const plan = planWindow(window, window, now_ms);
+    try std.testing.expectEqual(@as(?i64, window), plan.reset_ms);
+    try std.testing.expect(plan.reuse_cache);
+}
 
-    const cached = CacheResult{
-        .scan = .{
-            .today_cost = 5.0,
-            .block = .{ .start_ms = 0, .end_ms = resets_at_ms + 1000, .cost = 1.0, .burn_rate_per_hr = 0.5 },
-        },
-        .files = &[_]CachedFileEntry{
-            .{ .path = path, .file_size = 4, .per_file_cost = 5.0, .parsed_size = 4 },
-        },
-        .write_time_s = now_s - 10,
-        .last_full_scan_s = now_s - 100,
-        .day_start_ms = day_start_ms,
-    };
+test "planWindow drops the cache when the caller's reset disagrees" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const window = now_ms + 3600 * 1000;
+    const newer = window + block_duration_ms;
+    const plan = planWindow(window, newer, now_ms);
+    try std.testing.expectEqual(@as(?i64, newer), plan.reset_ms);
+    try std.testing.expect(!plan.reuse_cache);
+}
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, try tree.path("cache.bin")));
+test "planWindow drops an expired window instead of scanning by it" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const plan = planWindow(now_ms - 1000, null, now_ms);
+    try std.testing.expectEqual(@as(?i64, null), plan.reset_ms);
+    try std.testing.expect(!plan.reuse_cache);
+}
+
+test "planWindow treats a window ending exactly now as over" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const plan = planWindow(now_ms, null, now_ms);
+    try std.testing.expectEqual(@as(?i64, null), plan.reset_ms);
+    try std.testing.expect(!plan.reuse_cache);
+}
+
+test "planWindow keeps caching while no window is recorded" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const plan = planWindow(null, null, now_ms);
+    try std.testing.expectEqual(@as(?i64, null), plan.reset_ms);
+    try std.testing.expect(plan.reuse_cache);
+}
+
+test "planWindow rescans when the first authoritative reset arrives" {
+    const now_ms: i64 = 1_700_000_000_000;
+    const window = now_ms + 3600 * 1000;
+    const plan = planWindow(null, window, now_ms);
+    try std.testing.expectEqual(@as(?i64, window), plan.reset_ms);
+    try std.testing.expect(!plan.reuse_cache);
 }
 
 test "diffScan file grew recalculates cost" {
@@ -2171,7 +2236,7 @@ test "diffScan file grew recalculates cost" {
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin"));
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.today_cost > 1.0);
 }
@@ -2203,13 +2268,13 @@ test "diffScan total_diff_cost zero preserves cached block" {
         .day_start_ms = day_start_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, try tree.path("cache.bin"));
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expect(result.?.block != null);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.?.block.?.cost, 1e-10);
 }
 
-test "diffScan falls through to fullScan when cached block is null and new entries arrive with resets_at_ms" {
+test "diffScan falls through to fullScan when cached block is null and new entries arrive inside a known window" {
     // Reproduces the "5h block displayed late after window reset" bug:
     // When a fresh 5h window begins with no in-window entries, computeBlockFromWindow
     // caches block=null. Once a new entry is appended to the transcript, diffScan
@@ -2245,11 +2310,12 @@ test "diffScan falls through to fullScan when cached block is null and new entri
         .write_time_s = now_s - 60,
         .last_full_scan_s = now_s - 60,
         .day_start_ms = day_start_ms,
+        .window_end_ms = resets_at_ms,
     };
 
     try std.testing.expectEqual(
         @as(?ScanResult, null),
-        diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, try tree.path("cache.bin")),
+        diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")),
     );
 }
 
@@ -2279,9 +2345,10 @@ test "diffScan keeps cached null block when no files changed (no false fullScan)
         .write_time_s = now_s - 60,
         .last_full_scan_s = now_s - 60,
         .day_start_ms = day_start_ms,
+        .window_end_ms = resets_at_ms,
     };
 
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, resets_at_ms, try tree.path("cache.bin"));
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(?BlockInfo, null), result.?.block);
 }
@@ -2322,8 +2389,8 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
 
     // The finalized line lands after the cache was written.
     try createTmpFile(file_path, placeholder ++ "\n" ++ final ++ "\n");
-    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp) orelse
         return error.TestUnexpectedResult;
     const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 });
     try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
@@ -2333,8 +2400,8 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     // A yet-newer snapshot must replace the diff-counted one, not the
     // original placeholder — the tail is updated by the diff scan too.
     try createTmpFile(file_path, placeholder ++ "\n" ++ final ++ "\n" ++ final2 ++ "\n");
-    const cached2 = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
-    const result2 = diffScan(alloc, cached2, now_ms, now_s, day_start_ms, null, cp) orelse
+    const cached2 = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const result2 = diffScan(alloc, cached2, now_ms, now_s, day_start_ms, cp) orelse
         return error.TestUnexpectedResult;
     const expected2 = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 });
     try std.testing.expectApproxEqAbs(expected2, result2.today_cost, 1e-9);
@@ -2387,8 +2454,8 @@ test "diffScan replaces snapshot even when many messages interleave before final
     );
     try createTmpFile(file_path, content.written());
 
-    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp) orelse
         return error.TestUnexpectedResult;
 
     const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
@@ -2430,10 +2497,10 @@ test "diffScan falls back to fullScan when appended lines replay old history" {
     // Replay of m1 appended verbatim: its timestamp regresses 5 minutes below
     // the file's last counted entry.
     try createTmpFile(file_path, m1 ++ "\n" ++ m2 ++ "\n" ++ m1 ++ "\n");
-    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(
         @as(?ScanResult, null),
-        diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp),
+        diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp),
     );
 
     // The fullScan fallback collapses the replayed line via dedup.
@@ -2679,13 +2746,13 @@ test "cache partial file entries truncated" {
         .{ .path = "/tmp/f2.jsonl", .file_size = 200, .per_file_cost = 0.5, .parsed_size = 200 },
     };
     const day_start_ms: i64 = 1699920000000;
-    try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms);
+    try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms, null);
 
     const full_data = aw.writer.buffered();
     // Truncate after first file entry (2 path_len + path + 32 fixed fields +
     // 2 tail_len with empty tail) + partial second entry
     const truncated_len = cache_header_size + 2 + "/tmp/f1.jsonl".len + 32 + 2 + 5;
-    const result = parseCacheBytes(std.testing.allocator, full_data[0..truncated_len], day_start_ms) orelse
+    const result = parseCacheBytes(std.testing.allocator, full_data[0..truncated_len]) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
@@ -2701,9 +2768,9 @@ test "cache path length zero roundtrip" {
         .{ .path = "", .file_size = 0, .per_file_cost = 0, .parsed_size = 0 },
     };
     const day_start_ms: i64 = 1699920000000;
-    try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms);
+    try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms, null);
 
-    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered(), day_start_ms) orelse
+    const result = parseCacheBytes(std.testing.allocator, aw.writer.buffered()) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
     try std.testing.expectEqual(@as(usize, 1), result.files.len);
@@ -3125,8 +3192,8 @@ test "diffScan replaces the placeholder with the advisor-inclusive final line" {
     _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
 
     try createTmpFile(file_path, placeholder ++ "\n" ++ final ++ "\n");
-    const cached = readCache(alloc, day_start_ms, cp) orelse return error.TestUnexpectedResult;
-    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, null, cp) orelse
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp) orelse
         return error.TestUnexpectedResult;
 
     const opus = pricing.findPricing("claude-opus-5").?;
