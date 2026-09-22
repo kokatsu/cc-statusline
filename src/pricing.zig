@@ -13,9 +13,10 @@ pub const TokenUsage = struct {
 };
 
 /// Fast-mode per-token rates. Cache rates are derived from `input` via the
-/// standard Anthropic prompt-caching multipliers (5m write 1.25x, 1h write 2x,
-/// read 0.1x). If a future fast tier deviates from this convention, add
-/// explicit per-rate fields here.
+/// Anthropic prompt-caching multipliers: 5m write 1.25x, 1h write 2x, and the
+/// model's own read multiplier (`cache_read / input`, e.g. 0.05x on Opus 5.5).
+/// If a future fast tier deviates from this convention, add explicit per-rate
+/// fields here.
 pub const FastRates = struct {
     input: f64,
     output: f64,
@@ -50,6 +51,18 @@ pub const pricing_table = [_]ModelPricing{
     .{ .prefix = "claude-fable-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
     // Mythos 5 (limited availability; same rates as Fable 5)
     .{ .prefix = "claude-mythos-5", .input = 10e-6, .output = 50e-6, .cache_creation_5m = 12.5e-6, .cache_creation_1h = 20e-6, .cache_read = 1e-6 },
+    // Opus 5.5 (1M context at standard pricing; cache reads at 0.05x base
+    // input; fast mode $8/$40 per MTok). Must precede "claude-opus-5", which
+    // would otherwise prefix-match it.
+    .{
+        .prefix = "claude-opus-5-5",
+        .input = 4e-6,
+        .output = 20e-6,
+        .cache_creation_5m = 5e-6,
+        .cache_creation_1h = 8e-6,
+        .cache_read = 2e-7,
+        .fast = .{ .input = 8e-6, .output = 40e-6 },
+    },
     // Opus 5 (1M context at standard pricing; fast mode $10/$50 per MTok)
     .{
         .prefix = "claude-opus-5",
@@ -167,7 +180,7 @@ pub fn calculateEntryCost(pricing: ModelPricing, usage: TokenUsage) f64 {
     const output_rate = if (use_fast) fast.?.output else if (use_premium) (pricing.output_above_200k orelse pricing.output) else pricing.output;
     const cc5m_rate = if (use_fast) fast.?.input * 1.25 else if (use_premium) (pricing.cache_creation_5m_above_200k orelse pricing.cache_creation_5m) else pricing.cache_creation_5m;
     const cc1h_rate = if (use_fast) fast.?.input * 2.0 else if (use_premium) (pricing.cache_creation_1h_above_200k orelse pricing.cache_creation_1h) else pricing.cache_creation_1h;
-    const cr_rate = if (use_fast) fast.?.input * 0.1 else if (use_premium) (pricing.cache_read_above_200k orelse pricing.cache_read) else pricing.cache_read;
+    const cr_rate = if (use_fast) fast.?.input * (pricing.cache_read / pricing.input) else if (use_premium) (pricing.cache_read_above_200k orelse pricing.cache_read) else pricing.cache_read;
 
     return @as(f64, @floatFromInt(usage.input_tokens)) * input_rate +
         @as(f64, @floatFromInt(usage.output_tokens)) * output_rate +
@@ -232,6 +245,49 @@ test "calculateEntryCost opus 5 over 200k uses base rate" {
     const cost = calculateEntryCost(p, usage);
     // base rate: 300_000 * 5e-6 + 1000 * 25e-6 = 1.5 + 0.025 = 1.525
     try std.testing.expectApproxEqAbs(@as(f64, 1.525), cost, 1e-10);
+}
+
+test "calculateEntryCost opus 5.5 all five rates" {
+    const p = findPricing("claude-opus-5-5[1m]").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 1000*4e-6 + 500*20e-6 + 2000*5e-6 + 3000*8e-6 + 4000*2e-7
+    // = 0.004 + 0.01 + 0.01 + 0.024 + 0.0008 = 0.0488
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0488), cost, 1e-10);
+}
+
+test "calculateEntryCost opus 5.5 fast mode applies its 0.05x cache read multiplier" {
+    const p = findPricing("claude-opus-5-5").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+        .is_fast = true,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 1000*8e-6 + 500*40e-6 + 2000*(8e-6*1.25) + 3000*(8e-6*2) + 4000*(8e-6*0.05)
+    // = 0.008 + 0.02 + 0.02 + 0.048 + 0.0016 = 0.0976
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0976), cost, 1e-10);
+}
+
+test "calculateEntryCost opus 5.5 over 200k uses base rate" {
+    const p = findPricing("claude-opus-5-5").?;
+    try std.testing.expectEqual(@as(?f64, null), p.input_above_200k);
+    const usage = TokenUsage{
+        .input_tokens = 300_000,
+        .output_tokens = 1000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 300_000 * 4e-6 + 1000 * 20e-6 = 1.2 + 0.02 = 1.22
+    try std.testing.expectApproxEqAbs(@as(f64, 1.22), cost, 1e-10);
 }
 
 test "calculateEntryCost opus 4.8 fast mode uses explicit fast rates" {
@@ -581,6 +637,8 @@ test "findPricing all model prefixes" {
         .{ .model = "claude-fable-5-20260601", .prefix = "claude-fable-5" },
         .{ .model = "claude-fable-5[1m]", .prefix = "claude-fable-5" },
         .{ .model = "claude-mythos-5[1m]", .prefix = "claude-mythos-5" },
+        .{ .model = "claude-opus-5-5", .prefix = "claude-opus-5-5" },
+        .{ .model = "claude-opus-5-5[1m]", .prefix = "claude-opus-5-5" },
         .{ .model = "claude-opus-5", .prefix = "claude-opus-5" },
         .{ .model = "claude-opus-5[1m]", .prefix = "claude-opus-5" },
         .{ .model = "claude-opus-4-8", .prefix = "claude-opus-4-8" },
@@ -634,6 +692,16 @@ test "findPricing fable-5-1 and fable-5 do not collide" {
     try std.testing.expectEqualStrings("claude-mythos-5-1", findPricing("claude-mythos-5-1").?.prefix);
     try std.testing.expectEqualStrings("claude-mythos-5", findPricing("claude-mythos-5[1m]").?.prefix);
     try std.testing.expect(findPricing("claude-fable-5-1").?.cache_read != findPricing("claude-fable-5").?.cache_read);
+}
+
+test "findPricing opus-5-5 and opus-5 do not collide" {
+    // "claude-opus-5" is a prefix of "claude-opus-5-5"; the 5.5 entry must come
+    // first in the table or Opus 5.5 gets billed at Opus 5 rates.
+    try std.testing.expectEqualStrings("claude-opus-5-5", findPricing("claude-opus-5-5").?.prefix);
+    try std.testing.expectEqualStrings("claude-opus-5-5", findPricing("claude-opus-5-5[1m]").?.prefix);
+    try std.testing.expectEqualStrings("claude-opus-5", findPricing("claude-opus-5").?.prefix);
+    try std.testing.expectEqualStrings("claude-opus-5", findPricing("claude-opus-5[1m]").?.prefix);
+    try std.testing.expect(findPricing("claude-opus-5-5").?.cache_read != findPricing("claude-opus-5").?.cache_read);
 }
 
 test "findPricing opus-5 and opus-4 do not collide" {
