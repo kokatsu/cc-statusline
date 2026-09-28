@@ -111,6 +111,10 @@ pub const pricing_table = [_]ModelPricing{
     .{ .prefix = "claude-opus-4", .input = 15e-6, .output = 75e-6, .cache_creation_5m = 18.75e-6, .cache_creation_1h = 30e-6, .cache_read = 1.5e-6 },
     // Claude 3 Opus
     .{ .prefix = "claude-3-opus", .input = 15e-6, .output = 75e-6, .cache_creation_5m = 18.75e-6, .cache_creation_1h = 30e-6, .cache_read = 1.5e-6 },
+    // Sonnet 5.5 (1M context at standard pricing; same rates as Sonnet 5, no
+    // fast tier). Must precede "claude-sonnet-5", which would otherwise
+    // prefix-match it.
+    .{ .prefix = "claude-sonnet-5-5", .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 2e-7 },
     // Sonnet 5 (1M context at standard pricing; $2/$10 per MTok — the launch
     // rate was made permanent, cancelling the planned rise to $3/$15)
     .{ .prefix = "claude-sonnet-5", .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 2e-7 },
@@ -570,6 +574,35 @@ test "calculateEntryCost sonnet 5 over 200k uses base rate" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.501), cost, 1e-10);
 }
 
+test "calculateEntryCost sonnet 5.5 all five rates" {
+    const p = findPricing("claude-sonnet-5-5[1m]").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 1000*2e-6 + 500*10e-6 + 2000*2.5e-6 + 3000*4e-6 + 4000*2e-7
+    // = 0.002 + 0.005 + 0.005 + 0.012 + 0.0008 = 0.0248
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0248), cost, 1e-10);
+}
+
+test "calculateEntryCost sonnet 5.5 over 200k uses base rate and has no fast tier" {
+    const p = findPricing("claude-sonnet-5-5").?;
+    try std.testing.expectEqual(@as(?f64, null), p.input_above_200k);
+    try std.testing.expectEqual(@as(?FastRates, null), p.fast);
+    const usage = TokenUsage{
+        .input_tokens = 300_000,
+        .output_tokens = 1000,
+        .is_fast = true,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // base rate: 300_000 * 2e-6 + 1000 * 10e-6 = 0.6 + 0.01 = 0.61
+    try std.testing.expectApproxEqAbs(@as(f64, 0.61), cost, 1e-10);
+}
+
 test "calculateEntryCost is_fast on non-fast model falls back to standard rates" {
     // Sonnet 4.5 has no fast tier (pricing.fast == null), so is_fast=true is a
     // failsafe no-op: the entry is priced at standard rates (premium tier here
@@ -648,6 +681,8 @@ test "findPricing all model prefixes" {
         .{ .model = "claude-opus-4-1-20250929", .prefix = "claude-opus-4-1" },
         .{ .model = "claude-opus-4-20250929", .prefix = "claude-opus-4" },
         .{ .model = "claude-3-opus-20240229", .prefix = "claude-3-opus" },
+        .{ .model = "claude-sonnet-5-5", .prefix = "claude-sonnet-5-5" },
+        .{ .model = "claude-sonnet-5-5[1m]", .prefix = "claude-sonnet-5-5" },
         .{ .model = "claude-sonnet-5", .prefix = "claude-sonnet-5" },
         .{ .model = "claude-sonnet-4-6-20251212", .prefix = "claude-sonnet-4-6" },
         .{ .model = "claude-sonnet-4-5-20250929", .prefix = "claude-sonnet-4-5" },
@@ -680,6 +715,16 @@ test "findPricing prefix ordering specific sonnet-4 variants before generic sonn
 test "findPricing sonnet-5 and sonnet-4 do not collide" {
     try std.testing.expectEqualStrings("claude-sonnet-5", findPricing("claude-sonnet-5-20260615").?.prefix);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", findPricing("claude-sonnet-4-6-20251212").?.prefix);
+}
+
+test "findPricing sonnet-5-5 and sonnet-5 do not collide" {
+    // "claude-sonnet-5" is a prefix of "claude-sonnet-5-5"; the 5.5 entry must
+    // come first in the table or it is unreachable and any later change to its
+    // rates would be ignored.
+    try std.testing.expectEqualStrings("claude-sonnet-5-5", findPricing("claude-sonnet-5-5").?.prefix);
+    try std.testing.expectEqualStrings("claude-sonnet-5-5", findPricing("claude-sonnet-5-5[1m]").?.prefix);
+    try std.testing.expectEqualStrings("claude-sonnet-5", findPricing("claude-sonnet-5").?.prefix);
+    try std.testing.expectEqualStrings("claude-sonnet-5", findPricing("claude-sonnet-5[1m]").?.prefix);
 }
 
 test "findPricing fable-5-1 and fable-5 do not collide" {
