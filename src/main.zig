@@ -246,7 +246,8 @@ fn mainImpl(init: std.process.Init) !void {
 
     // Scan transcripts (or use cache)
     const resets_at_ms: ?i64 = if (stdin_info.rate_limit_5h) |rl| rl.resets_at_ms else null;
-    const scan_result = scan.scanTranscripts(io, init.environ_map, allocator, now_ms, day_start_ms, resets_at_ms);
+    const scan_output = scan.scanTranscripts(io, init.environ_map, allocator, now_ms, day_start_ms, resets_at_ms, &.{});
+    const scan_result: ?types.ScanResult = if (scan_output) |o| o.scan else null;
 
     // Resolve git branch
     var branch_buf: [256]u8 = undefined;

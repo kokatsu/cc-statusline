@@ -37,8 +37,21 @@ pub const DedupSet = struct {
 
     map: std.AutoHashMapUnmanaged(u64, Slot) = .empty,
     gen: u32 = 0,
+    /// Keep-last snapshot of each message the current list's file shares
+    /// with an earlier list. Those lines stay out of `entries`, but they
+    /// still belong to the file's own `lifetime_cost`, and to its tail so a
+    /// later finalized line in this file replaces them. Cleared at every gen
+    /// bump.
+    cross: std.AutoHashMapUnmanaged(u64, TailEntry) = .empty,
 
     pub const empty: DedupSet = .{};
+
+    pub fn crossCostSum(self: *const DedupSet) f64 {
+        var sum: f64 = 0;
+        var it = self.cross.valueIterator();
+        while (it.next()) |t| sum += t.cost;
+        return sum;
+    }
 };
 
 pub const cache_name = "statusline-cache.bin";
@@ -47,7 +60,7 @@ const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
 
 const cache_magic = [4]u8{ 'C', 'C', 'S', 'L' };
-const cache_ver: u32 = 9;
+const cache_ver: u32 = 10;
 const file_list_ttl_s: i64 = 300;
 // Actual caches are ~tens of KB; cap at 1 MiB to fail fast on corruption.
 const cache_max_bytes: usize = 1 * 1024 * 1024;
@@ -105,14 +118,26 @@ const tail_max = 16;
 /// them correctly. Sub-minute jitter from interleaved writers is tolerated.
 const replay_slack_ms: i64 = 60 * 1000;
 
-const CachedFileEntry = struct {
+pub const CachedFileEntry = struct {
     path: []const u8,
     file_size: i64,
     per_file_cost: f64,
+    /// Cost of every entry in the file, deduplicated within the file only.
+    /// A cross-file dedup would make the value depend on which other files
+    /// the scan saw first, so a session's transcript cost would move without
+    /// any spend.
+    lifetime_cost: f64 = 0,
     parsed_size: i64,
     /// Newest entry timestamp counted for this file; 0 when no entry yet.
     last_entry_ts: i64 = 0,
     tail: []const TailEntry = &.{},
+};
+
+pub const ScanOutput = struct {
+    scan: ScanResult,
+    /// Every transcript the scan tracks, for per-file lookups such as a
+    /// session's lifetime cost.
+    files: []const CachedFileEntry,
 };
 
 const CacheResult = struct {
@@ -149,7 +174,7 @@ fn getConfigDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Ma
     return resolveConfigDir(allocator, env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"));
 }
 
-const FileInfo = struct {
+pub const FileInfo = struct {
     path: []const u8,
     size: i64,
 };
@@ -243,6 +268,7 @@ pub fn parseJsonlReader(
     // Each reader call parses into a fresh entries list; the bump lets dedup
     // slots tell same-list duplicates (overwrite) from cross-list ones (skip).
     seen.gen +%= 1;
+    seen.cross.clearRetainingCapacity();
     while (true) {
         const line_opt = reader.takeDelimiter('\n') catch |err| switch (err) {
             error.StreamTooLong => {
@@ -790,18 +816,32 @@ fn parseJsonlLine(
         if (gop.found_existing) {
             // Duplicate from a different entries list (copied session file):
             // keep the existing entry; the slot's index points elsewhere.
-            if (gop.value_ptr.gen != seen.gen) return;
+            if (gop.value_ptr.gen != seen.gen) return recordCrossDuplicate(&p, dedup_alloc, dedup_hash, seen);
         } else {
             gop.value_ptr.* = .{ .gen = seen.gen, .index = DedupSet.no_entry };
         }
         slot = gop.value_ptr;
     };
 
-    if (!p.have_usage) return;
-    const ts_str = p.timestamp_str orelse return;
-    const timestamp_ms = time.parseIso8601ToMs(ts_str) orelse return;
+    const entry = entryFromParser(&p, dedup_hash) orelse return;
 
-    const entry = TranscriptEntry{
+    // A same-list duplicate carries a fresher usage snapshot — the final
+    // streaming line has the finalized output_tokens — so replace in place.
+    if (slot) |s| {
+        if (s.index != DedupSet.no_entry) {
+            entries.items[s.index] = entry;
+            return;
+        }
+    }
+    try entries.append(allocator, entry);
+    if (slot) |s| s.index = @intCast(entries.items.len - 1);
+}
+
+fn entryFromParser(p: *const Parser, dedup_hash: u64) ?TranscriptEntry {
+    if (!p.have_usage) return null;
+    const ts_str = p.timestamp_str orelse return null;
+    const timestamp_ms = time.parseIso8601ToMs(ts_str) orelse return null;
+    return .{
         .timestamp_ms = timestamp_ms,
         .model = pricing.staticPrefixOf(p.model),
         .usage = .{
@@ -815,17 +855,17 @@ fn parseJsonlLine(
         .dedup_hash = dedup_hash,
         .advisor_cost = p.advisor_cost,
     };
+}
 
-    // A same-list duplicate carries a fresher usage snapshot — the final
-    // streaming line has the finalized output_tokens — so replace in place.
-    if (slot) |s| {
-        if (s.index != DedupSet.no_entry) {
-            entries.items[s.index] = entry;
-            return;
-        }
-    }
-    try entries.append(allocator, entry);
-    if (slot) |s| s.index = @intCast(entries.items.len - 1);
+/// Kept out of line: cross-file duplicates are rare, so their extra work
+/// stays out of the per-line path.
+noinline fn recordCrossDuplicate(p: *const Parser, dedup_alloc: std.mem.Allocator, dedup_hash: u64, seen: *DedupSet) !void {
+    const entry = entryFromParser(p, dedup_hash) orelse return;
+    try seen.cross.put(dedup_alloc, dedup_hash, .{
+        .hash = dedup_hash,
+        .timestamp_ms = entry.timestamp_ms,
+        .cost = entryCost(entry),
+    });
 }
 
 // ============================================================
@@ -843,9 +883,10 @@ fn entryCost(entry: TranscriptEntry) f64 {
 }
 
 /// Build the cache tail for one file: the `tail_max` unique messages with the
-/// newest timestamps among `old_tail` (a previous scan's tail) and `entries`
-/// (this scan's parse of the same file). A hash appearing in both — the
-/// finalized snapshot of a message counted earlier — keeps the newest value.
+/// newest timestamps among `old_tail` (a previous scan's tail), `cross` (this
+/// scan's cross-file duplicates in the file) and `entries` (this scan's parse
+/// of the same file). A hash appearing in more than one — the finalized
+/// snapshot of a message counted earlier — keeps the newest value.
 ///
 /// Selection is by timestamp, not slot position: keep-last dedup overwrites a
 /// streaming message's original slot in place, so by position it could sit
@@ -856,7 +897,12 @@ fn entryCost(entry: TranscriptEntry) f64 {
 /// Returns an allocator-owned slice, oldest-first; degrades to an empty tail
 /// on alloc failure (only cost: a later duplicate double-counts, which is the
 /// pre-tail behavior).
-fn buildTail(allocator: std.mem.Allocator, old_tail: []const TailEntry, entries: []const TranscriptEntry) []const TailEntry {
+fn buildTail(
+    allocator: std.mem.Allocator,
+    old_tail: []const TailEntry,
+    cross: *const std.AutoHashMapUnmanaged(u64, TailEntry),
+    entries: []const TranscriptEntry,
+) []const TailEntry {
     const Cand = struct { t: TailEntry, seq: u32 };
     const S = struct {
         fn older(a: Cand, b: Cand) bool {
@@ -868,12 +914,17 @@ fn buildTail(allocator: std.mem.Allocator, old_tail: []const TailEntry, entries:
         }
     };
 
-    // Newest value per hash: `entries` values overwrite `old_tail` values.
+    // Newest value per hash: this scan's values overwrite `old_tail` values.
     var map: std.AutoHashMapUnmanaged(u64, Cand) = .empty;
     defer map.deinit(allocator);
     var seq: u32 = 0;
     for (old_tail) |t| {
         map.put(allocator, t.hash, .{ .t = t, .seq = seq }) catch return &.{};
+        seq += 1;
+    }
+    var cross_it = cross.valueIterator();
+    while (cross_it.next()) |t| {
+        map.put(allocator, t.hash, .{ .t = t.*, .seq = seq }) catch return &.{};
         seq += 1;
     }
     for (entries) |e| {
@@ -1055,9 +1106,10 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8) ?CacheResu
         if (pos + path_len > content.len) break;
         const path = content[pos..][0..path_len];
         pos += path_len;
-        if (pos + 32 > content.len) break;
+        if (pos + 40 > content.len) break;
         const file_size = readVal(i64, content, &pos);
         const per_file_cost = readVal(f64, content, &pos);
+        const lifetime_cost = readVal(f64, content, &pos);
         const parsed_size = readVal(i64, content, &pos);
         const last_entry_ts = readVal(i64, content, &pos);
         if (pos + 2 > content.len) break;
@@ -1077,6 +1129,7 @@ fn parseCacheBytes(allocator: std.mem.Allocator, content: []const u8) ?CacheResu
             .path = path,
             .file_size = file_size,
             .per_file_cost = per_file_cost,
+            .lifetime_cost = lifetime_cost,
             .parsed_size = parsed_size,
             .last_entry_ts = last_entry_ts,
             .tail = tail,
@@ -1133,6 +1186,7 @@ fn serializeCacheBytes(w: anytype, result: ScanResult, files: []const CachedFile
         try w.writeAll(entry.path);
         try writeVal(w, entry.file_size);
         try writeVal(w, entry.per_file_cost);
+        try writeVal(w, entry.lifetime_cost);
         try writeVal(w, entry.parsed_size);
         try writeVal(w, entry.last_entry_ts);
         try writeVal(w, @as(u16, @intCast(entry.tail.len)));
@@ -1201,7 +1255,7 @@ fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, la
 pub fn benchFullScan(io: Io, allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, day_start_ms: i64, cp: []const u8) ScanResult {
     g_io = io;
     const now_s = @divFloor(now_ms, @as(i64, 1000));
-    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, null, cp);
+    return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, null, cp).scan;
 }
 
 /// Phases of `benchFullScanProfiled`. Used as both a label source and an index
@@ -1278,11 +1332,12 @@ pub fn benchFullScanProfiled(
         ts = Io.Clock.awake.now(io);
         const new_items = all_entries.items[start_idx..];
         var per_cost: f64 = 0;
+        var lifetime_cost = global_seen.crossCostSum();
         var last_ts: i64 = 0;
         for (new_items) |entry| {
-            if (entry.timestamp_ms >= day_start_ms) {
-                per_cost += entryCost(entry);
-            }
+            const cost = entryCost(entry);
+            lifetime_cost += cost;
+            if (entry.timestamp_ms >= day_start_ms) per_cost += cost;
             if (entry.timestamp_ms > last_ts) last_ts = entry.timestamp_ms;
         }
         total_today_cost += per_cost;
@@ -1292,9 +1347,10 @@ pub fn benchFullScanProfiled(
             .path = fi.path,
             .file_size = fi.size,
             .per_file_cost = per_cost,
+            .lifetime_cost = lifetime_cost,
             .parsed_size = fi.size,
             .last_entry_ts = last_ts,
-            .tail = buildTail(allocator, &.{}, new_items),
+            .tail = buildTail(allocator, &.{}, &global_seen.cross, new_items),
         }) catch {};
         timings[@intFromEnum(Phase.cost)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
     }
@@ -1312,6 +1368,31 @@ pub fn benchFullScanProfiled(
     timings[@intFromEnum(Phase.write_cache)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
 
     return result;
+}
+
+pub const FileCost = struct {
+    size: i64,
+    cost: f64,
+};
+
+/// Lifetime cost of one transcript parsed from scratch, deduplicated within
+/// the file: the same count `CachedFileEntry.lifetime_cost` keeps, for files
+/// the shared cache does not track. `size` is the size stat reported before
+/// the read, so an append racing the parse makes it lag the cost and the
+/// next caller re-parses.
+pub fn parseFileLifetimeCost(io: Io, allocator: std.mem.Allocator, path: []const u8) ?FileCost {
+    g_io = io;
+    const stat = Io.Dir.cwd().statFile(io, path, .{}) catch return null;
+    var f = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer f.close(io);
+    var rbuf: [jsonl_buf_size]u8 = undefined;
+    var reader = f.readerStreaming(io, &rbuf);
+    var entries: std.ArrayList(TranscriptEntry) = .empty;
+    var seen: DedupSet = .empty;
+    parseJsonlReader(allocator, allocator, &reader.interface, &entries, &seen);
+    var cost: f64 = 0;
+    for (entries.items) |e| cost += entryCost(e);
+    return .{ .size = @intCast(stat.size), .cost = cost };
 }
 
 /// Which 5-hour window the next scan runs against, and whether the cached
@@ -1337,7 +1418,9 @@ fn planWindow(cached_window_ms: ?i64, resets_at_ms: ?i64, now_ms: i64) WindowPla
     };
 }
 
-pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64) ?ScanResult {
+/// `fresh` lists files whose cached entries must match their current size,
+/// even within the cache TTL; any that differ force a rescan.
+pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64, fresh: []const FileInfo) ?ScanOutput {
     g_io = io;
     const config_dir = getConfigDir(allocator, env) catch return null;
     const projects_path = std.fmt.allocPrint(allocator, "{s}/projects", .{config_dir}) catch return null;
@@ -1352,8 +1435,8 @@ pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: s
         reset_ms = plan.reset_ms;
 
         if (plan.reuse_cache and cached.day_start_ms == day_start_ms) {
-            if (now_s - cached.write_time_s <= cache_ttl_s) {
-                return cached.scan;
+            if (now_s - cached.write_time_s <= cache_ttl_s and !anyTrackedSizeDiffers(cached.files, fresh)) {
+                return .{ .scan = cached.scan, .files = cached.files };
             }
             // TTL expired, but file list is still fresh — try stat-only diff
             if (now_s - cached.last_full_scan_s <= file_list_ttl_s and cached.files.len > 0) {
@@ -1367,9 +1450,23 @@ pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: s
     return fullScan(allocator, projects_path, now_ms, now_s, day_start_ms, reset_ms, cp);
 }
 
+/// Files absent from `files` are not compared: a scan cannot pick them up
+/// before the next full scan anyway.
+fn anyTrackedSizeDiffers(files: []const CachedFileEntry, current: []const FileInfo) bool {
+    for (current) |c| {
+        for (files) |f| {
+            if (mem.eql(u8, f.path, c.path)) {
+                if (f.file_size != c.size) return true;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
 /// Stat-only diff scan: check cached files for size changes, parse only new bytes.
 /// Returns null if any file shrank/disappeared (caller should fall back to full scan).
-fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_s: i64, day_start_ms: i64, cp: []const u8) ?ScanResult {
+fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_s: i64, day_start_ms: i64, cp: []const u8) ?ScanOutput {
     var changed: std.StringHashMapUnmanaged(CachedFileEntry) = .empty;
     var any_shrunk = false;
 
@@ -1387,6 +1484,7 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
                 .path = entry.path,
                 .file_size = current_size,
                 .per_file_cost = entry.per_file_cost,
+                .lifetime_cost = entry.lifetime_cost,
                 .parsed_size = entry.parsed_size,
             }) catch return null;
         }
@@ -1396,7 +1494,7 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
 
     if (changed.count() == 0) {
         writeCache(cached.scan, cached.files, now_s, cached.last_full_scan_s, day_start_ms, cached.window_end_ms, cp);
-        return cached.scan;
+        return .{ .scan = cached.scan, .files = cached.files };
     }
 
     // If the cached block is null but a window is active, diffScan cannot
@@ -1442,11 +1540,19 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
             for (entry.tail) |t| tail_map.put(allocator, t.hash, t) catch {};
 
             var today_file_diff_cost: f64 = 0;
+            var lifetime_diff_cost: f64 = 0;
+            var cross_it = global_seen.cross.valueIterator();
+            while (cross_it.next()) |c| {
+                lifetime_diff_cost += c.cost;
+                if (tail_map.get(c.hash)) |o| lifetime_diff_cost -= o.cost;
+            }
             var last_ts = entry.last_entry_ts;
             for (entries.items) |e| {
                 const cost = entryCost(e);
                 const old: ?TailEntry = if (e.dedup_hash != 0) tail_map.get(e.dedup_hash) else null;
+                lifetime_diff_cost += cost;
                 if (old) |o| {
+                    lifetime_diff_cost -= o.cost;
                     if (o.timestamp_ms >= day_start_ms) {
                         today_file_diff_cost -= o.cost;
                     }
@@ -1471,9 +1577,10 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
                 .path = ch.path,
                 .file_size = ch.file_size,
                 .per_file_cost = entry.per_file_cost + today_file_diff_cost,
+                .lifetime_cost = entry.lifetime_cost + lifetime_diff_cost,
                 .parsed_size = ch.file_size,
                 .last_entry_ts = last_ts,
-                .tail = buildTail(allocator, entry.tail, entries.items),
+                .tail = buildTail(allocator, entry.tail, &global_seen.cross, entries.items),
             }) catch continue;
         } else {
             new_files.append(allocator, entry) catch continue;
@@ -1505,10 +1612,10 @@ fn diffScan(allocator: std.mem.Allocator, cached: CacheResult, now_ms: i64, now_
     };
     const new_file_entries = new_files.toOwnedSlice(allocator) catch cached.files;
     writeCache(result, new_file_entries, now_s, cached.last_full_scan_s, day_start_ms, cached.window_end_ms, cp);
-    return result;
+    return .{ .scan = result, .files = new_file_entries };
 }
 
-fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64, cp: []const u8) ScanResult {
+fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64, now_s: i64, day_start_ms: i64, resets_at_ms: ?i64, cp: []const u8) ScanOutput {
     const file_infos = collectTranscriptFiles(allocator, projects_path, now_ms);
     var all_entries: std.ArrayList(TranscriptEntry) = .empty;
     var cache_files: std.ArrayList(CachedFileEntry) = .empty;
@@ -1539,11 +1646,12 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
 
         const new_items = all_entries.items[start_idx..];
         var per_cost: f64 = 0;
+        var lifetime_cost = global_seen.crossCostSum();
         var last_ts: i64 = 0;
         for (new_items) |entry| {
-            if (entry.timestamp_ms >= day_start_ms) {
-                per_cost += entryCost(entry);
-            }
+            const cost = entryCost(entry);
+            lifetime_cost += cost;
+            if (entry.timestamp_ms >= day_start_ms) per_cost += cost;
             if (entry.timestamp_ms > last_ts) last_ts = entry.timestamp_ms;
         }
         total_today_cost += per_cost;
@@ -1551,9 +1659,10 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
             .path = fi.path,
             .file_size = fi.size,
             .per_file_cost = per_cost,
+            .lifetime_cost = lifetime_cost,
             .parsed_size = fi.size,
             .last_entry_ts = last_ts,
-            .tail = buildTail(allocator, &.{}, new_items),
+            .tail = buildTail(allocator, &.{}, &global_seen.cross, new_items),
         }) catch continue;
     }
 
@@ -1563,7 +1672,7 @@ fn fullScan(allocator: std.mem.Allocator, projects_path: []const u8, now_ms: i64
     };
     const cf = cache_files.toOwnedSlice(allocator) catch &.{};
     writeCache(result, cf, now_s, now_s, day_start_ms, resets_at_ms, cp);
-    return result;
+    return .{ .scan = result, .files = cf };
 }
 
 // ============================================================
@@ -2099,7 +2208,7 @@ test "diffScan no files changed returns cached result" {
 
     const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
-    try std.testing.expectApproxEqAbs(@as(f64, 5.0), result.?.today_cost, 1e-10);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), result.?.scan.today_cost, 1e-10);
 }
 
 test "diffScan file shrank returns null" {
@@ -2125,7 +2234,7 @@ test "diffScan file shrank returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")));
+    try std.testing.expectEqual(@as(?ScanOutput, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")));
 }
 
 test "diffScan file disappeared returns null" {
@@ -2149,7 +2258,7 @@ test "diffScan file disappeared returns null" {
         .day_start_ms = day_start_ms,
     };
 
-    try std.testing.expectEqual(@as(?ScanResult, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")));
+    try std.testing.expectEqual(@as(?ScanOutput, null), diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")));
 }
 
 test "planWindow carries a live window to a caller without one" {
@@ -2238,7 +2347,7 @@ test "diffScan file grew recalculates cost" {
 
     const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.today_cost > 1.0);
+    try std.testing.expect(result.?.scan.today_cost > 1.0);
 }
 
 test "diffScan total_diff_cost zero preserves cached block" {
@@ -2270,8 +2379,8 @@ test "diffScan total_diff_cost zero preserves cached block" {
 
     const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
-    try std.testing.expect(result.?.block != null);
-    try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.?.block.?.cost, 1e-10);
+    try std.testing.expect(result.?.scan.block != null);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.?.scan.block.?.cost, 1e-10);
 }
 
 test "diffScan falls through to fullScan when cached block is null and new entries arrive inside a known window" {
@@ -2314,7 +2423,7 @@ test "diffScan falls through to fullScan when cached block is null and new entri
     };
 
     try std.testing.expectEqual(
-        @as(?ScanResult, null),
+        @as(?ScanOutput, null),
         diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin")),
     );
 }
@@ -2350,7 +2459,7 @@ test "diffScan keeps cached null block when no files changed (no false fullScan)
 
     const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, try tree.path("cache.bin"));
     try std.testing.expect(result != null);
-    try std.testing.expectEqual(@as(?BlockInfo, null), result.?.block);
+    try std.testing.expectEqual(@as(?BlockInfo, null), result.?.scan.block);
 }
 
 test "diffScan replaces cached streaming placeholder instead of double counting" {
@@ -2393,9 +2502,9 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp) orelse
         return error.TestUnexpectedResult;
     const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 });
-    try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
+    try std.testing.expectApproxEqAbs(expected, result.scan.today_cost, 1e-9);
     // The active block contains both snapshots, so its cost is replaced too.
-    try std.testing.expectApproxEqAbs(expected, result.block.?.cost, 1e-9);
+    try std.testing.expectApproxEqAbs(expected, result.scan.block.?.cost, 1e-9);
 
     // A yet-newer snapshot must replace the diff-counted one, not the
     // original placeholder — the tail is updated by the diff scan too.
@@ -2404,7 +2513,7 @@ test "diffScan replaces cached streaming placeholder instead of double counting"
     const result2 = diffScan(alloc, cached2, now_ms, now_s, day_start_ms, cp) orelse
         return error.TestUnexpectedResult;
     const expected2 = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 });
-    try std.testing.expectApproxEqAbs(expected2, result2.today_cost, 1e-9);
+    try std.testing.expectApproxEqAbs(expected2, result2.scan.today_cost, 1e-9);
 }
 
 test "diffScan replaces snapshot even when many messages interleave before finalization" {
@@ -2462,7 +2571,7 @@ test "diffScan replaces snapshot even when many messages interleave before final
     const filler = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 100 });
     const x_final = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 2000 });
     const expected = @as(f64, @floatFromInt(tail_max + 1)) * filler + x_final;
-    try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
+    try std.testing.expectApproxEqAbs(expected, result.scan.today_cost, 1e-9);
 }
 
 test "diffScan falls back to fullScan when appended lines replay old history" {
@@ -2499,7 +2608,7 @@ test "diffScan falls back to fullScan when appended lines replay old history" {
     try createTmpFile(file_path, m1 ++ "\n" ++ m2 ++ "\n" ++ m1 ++ "\n");
     const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(
-        @as(?ScanResult, null),
+        @as(?ScanOutput, null),
         diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp),
     );
 
@@ -2735,6 +2844,177 @@ test "fullScan today cost counts entries from the day start on and prices unknow
 
 // --- parseCacheBytes corruption ---
 
+fn findCachedFile(files: []const CachedFileEntry, path: []const u8) ?CachedFileEntry {
+    for (files) |f| {
+        if (mem.eql(u8, f.path, path)) return f;
+    }
+    return null;
+}
+
+test "fullScan lifetime_cost spans past days and dedups within the file only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const a_path = try tree.path("projects/proj/a.jsonl");
+    const b_path = try tree.path("projects/proj/b.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
+
+    const yesterday =
+        \\{"timestamp":"2025-06-14T10:00:00Z","message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":100}},"requestId":"req_1"}
+    ;
+    const shared =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_2","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":2000,"output_tokens":200}},"requestId":"req_2"}
+    ;
+    const own_b =
+        \\{"timestamp":"2025-06-15T11:00:00Z","message":{"id":"msg_3","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":3000,"output_tokens":300}},"requestId":"req_3"}
+    ;
+    try createTmpFile(a_path, yesterday ++ "\n" ++ shared ++ "\n");
+    try createTmpFile(b_path, shared ++ "\n" ++ own_b ++ "\n");
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const result = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+    const c1 = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 100 });
+    const c2 = pricing.calculateEntryCost(p, .{ .input_tokens = 2000, .output_tokens = 200 });
+    const c3 = pricing.calculateEntryCost(p, .{ .input_tokens = 3000, .output_tokens = 300 });
+    // today still dedups across files.
+    try std.testing.expectApproxEqAbs(c2 + c3, result.today_cost, 1e-12);
+
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const a = findCachedFile(cached.files, a_path) orelse return error.TestUnexpectedResult;
+    const b = findCachedFile(cached.files, b_path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(c1 + c2, a.lifetime_cost, 1e-12);
+    try std.testing.expectApproxEqAbs(c2 + c3, b.lifetime_cost, 1e-12);
+    // Whichever file the scan reached first, the direct parse agrees.
+    try std.testing.expectApproxEqAbs(a.lifetime_cost, parseFileLifetimeCost(std.testing.io, alloc, a_path).?.cost, 1e-12);
+    try std.testing.expectApproxEqAbs(b.lifetime_cost, parseFileLifetimeCost(std.testing.io, alloc, b_path).?.cost, 1e-12);
+}
+
+test "diffScan lifetime_cost replaces a streaming snapshot and keeps past days" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const file_path = try tree.path("projects/proj/session.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
+
+    const yesterday =
+        \\{"timestamp":"2025-06-14T10:00:00Z","message":{"id":"msg_0","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":100}},"requestId":"req_0"}
+    ;
+    const placeholder =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":6}},"requestId":"req_1"}
+    ;
+    const final =
+        \\{"timestamp":"2025-06-15T10:00:05Z","message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":751}},"requestId":"req_1"}
+    ;
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+
+    try createTmpFile(file_path, yesterday ++ "\n" ++ placeholder ++ "\n");
+    _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+    try createTmpFile(file_path, yesterday ++ "\n" ++ placeholder ++ "\n" ++ final ++ "\n");
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp) orelse
+        return error.TestUnexpectedResult;
+
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 1000, .output_tokens = 100 }) +
+        pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 });
+    const entry = findCachedFile(result.files, file_path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(expected, entry.lifetime_cost, 1e-9);
+    try std.testing.expectApproxEqAbs(expected, parseFileLifetimeCost(std.testing.io, alloc, file_path).?.cost, 1e-9);
+}
+
+test "diffScan replaces a streaming snapshot first counted as a cross-file duplicate" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const projects = try tree.path("projects");
+    const a_path = try tree.path("projects/proj/a.jsonl");
+    const b_path = try tree.path("projects/proj/b.jsonl");
+    const cp = try tree.path("cache.bin");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
+
+    const placeholder =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":6}},"requestId":"req_1"}
+    ;
+    const final =
+        \\{"timestamp":"2025-06-15T10:00:05Z","message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":100000,"output_tokens":751}},"requestId":"req_1"}
+    ;
+    try createTmpFile(a_path, placeholder ++ "\n");
+    try createTmpFile(b_path, placeholder ++ "\n");
+
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const now_s = @divFloor(now_ms, @as(i64, 1000));
+    _ = benchFullScan(std.testing.io, alloc, projects, now_ms, day_start_ms, cp);
+
+    // Directory order decides which file owns the message; the finalized
+    // line goes to the other one, where it was a cross-file duplicate.
+    const cached = readCache(alloc, cp) orelse return error.TestUnexpectedResult;
+    const a = findCachedFile(cached.files, a_path) orelse return error.TestUnexpectedResult;
+    const cross_path = if (a.per_file_cost == 0) a_path else b_path;
+    try createTmpFile(cross_path, placeholder ++ "\n" ++ final ++ "\n");
+
+    const result = diffScan(alloc, cached, now_ms, now_s, day_start_ms, cp) orelse
+        return error.TestUnexpectedResult;
+    const p = pricing.findPricing("claude-sonnet-4-5-20250929").?;
+    const expected = pricing.calculateEntryCost(p, .{ .input_tokens = 100_000, .output_tokens = 751 });
+    const entry = findCachedFile(result.files, cross_path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(expected, entry.lifetime_cost, 1e-9);
+    try std.testing.expectApproxEqAbs(parseFileLifetimeCost(std.testing.io, alloc, cross_path).?.cost, entry.lifetime_cost, 1e-9);
+    // today held the owner's placeholder; the finalized line replaces it.
+    try std.testing.expectApproxEqAbs(expected, result.scan.today_cost, 1e-9);
+}
+
+test "scanTranscripts rescans within the TTL when a fresh file grew" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tree = try TestTree.init(alloc);
+    defer tree.deinit();
+    const file_path = try tree.path("projects/proj/session.jsonl");
+    try tree.tmp.dir.createDirPath(std.testing.io, "projects/proj");
+
+    const first =
+        \\{"timestamp":"2025-06-15T10:00:00Z","message":{"id":"msg_1","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":100}},"requestId":"req_1"}
+    ;
+    const second =
+        \\{"timestamp":"2025-06-15T10:01:00Z","message":{"id":"msg_2","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":100}},"requestId":"req_2"}
+    ;
+    try createTmpFile(file_path, first ++ "\n");
+
+    var env: std.process.Environ.Map = .init(alloc);
+    try env.put("CLAUDE_CONFIG_DIR", tree.root);
+    const day_start_ms: i64 = time.daysFromCivil(2025, 6, 15) * 86400 * 1000;
+    const now_ms: i64 = day_start_ms + 12 * 3600 * 1000;
+    const one = (scanTranscripts(std.testing.io, &env, alloc, now_ms, day_start_ms, null, &.{}) orelse
+        return error.TestUnexpectedResult).scan.today_cost;
+
+    try createTmpFile(file_path, first ++ "\n" ++ second ++ "\n");
+    const fresh = [_]FileInfo{.{ .path = file_path, .size = statFileSize(file_path) }};
+    // Same second: the TTL alone would return the cached single entry.
+    const stale = scanTranscripts(std.testing.io, &env, alloc, now_ms, day_start_ms, null, &.{}) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(one, stale.scan.today_cost, 1e-12);
+    const rescanned = scanTranscripts(std.testing.io, &env, alloc, now_ms, day_start_ms, null, &fresh) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(2 * one, rescanned.scan.today_cost, 1e-12);
+}
+
 test "cache partial file entries truncated" {
     const Writer = std.Io.Writer;
     var aw: Writer.Allocating = .init(std.testing.allocator);
@@ -2749,9 +3029,9 @@ test "cache partial file entries truncated" {
     try serializeCacheBytes(&aw.writer, scan, &files, 100, 100, day_start_ms, null);
 
     const full_data = aw.writer.buffered();
-    // Truncate after first file entry (2 path_len + path + 32 fixed fields +
+    // Truncate after first file entry (2 path_len + path + 40 fixed fields +
     // 2 tail_len with empty tail) + partial second entry
-    const truncated_len = cache_header_size + 2 + "/tmp/f1.jsonl".len + 32 + 2 + 5;
+    const truncated_len = cache_header_size + 2 + "/tmp/f1.jsonl".len + 40 + 2 + 5;
     const result = parseCacheBytes(std.testing.allocator, full_data[0..truncated_len]) orelse
         return error.TestUnexpectedResult;
     defer std.testing.allocator.free(result.files);
@@ -3200,7 +3480,7 @@ test "diffScan replaces the placeholder with the advisor-inclusive final line" {
     const fable = pricing.findPricing("claude-fable-5").?;
     const expected = pricing.calculateEntryCost(opus, .{ .input_tokens = 100, .output_tokens = 751 }) +
         pricing.calculateEntryCost(fable, .{ .input_tokens = 90_249, .output_tokens = 15_417 });
-    try std.testing.expectApproxEqAbs(expected, result.today_cost, 1e-9);
+    try std.testing.expectApproxEqAbs(expected, result.scan.today_cost, 1e-9);
 }
 
 test "parseJsonlContent malformed iterations array drops the line" {
