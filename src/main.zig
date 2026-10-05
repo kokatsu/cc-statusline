@@ -77,6 +77,9 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
         if (model.get("id")) |id| info.model_id = getStr(id);
         if (model.get("display_name")) |name| info.model_name = getStr(name);
     }
+    if (getObjField(root, "cost")) |cost| {
+        if (cost.get("total_cost_usd")) |usd| info.session_cost = getF64(usd);
+    }
     if (getObjField(root, "context_window")) |ctx| {
         if (ctx.get("used_percentage")) |pct| info.context_pct = getF64(pct);
         if (ctx.get("context_window_size")) |sz| info.context_window_size = getI64(sz);
@@ -91,7 +94,9 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
             info.context_tokens = getI64(t);
         }
     }
+    if (root.get("session_id")) |v| info.session_id = getStr(v);
     if (root.get("session_name")) |v| info.session_name = getStr(v);
+    if (root.get("transcript_path")) |v| info.transcript_path = getStr(v);
     if (root.get("cwd")) |v| info.cwd = getStr(v);
 
     // Parse rate_limits (added in Claude Code v2.1.80)
@@ -582,6 +587,18 @@ test "parseStdin exceeds_200k_tokens missing defaults to false" {
     defer arena.deinit();
     const info = parseStdin(arena.allocator(), "{}");
     try std.testing.expectEqual(false, info.exceeds_200k_tokens);
+}
+
+test "parseStdin session identity and cost" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const input =
+        \\{"session_id":"abc-123","transcript_path":"/home/user/.claude/projects/p/abc-123.jsonl","cost":{"total_cost_usd":2.5}}
+    ;
+    const info = parseStdin(arena.allocator(), input);
+    try std.testing.expectEqualStrings("abc-123", info.session_id.?);
+    try std.testing.expectEqualStrings("/home/user/.claude/projects/p/abc-123.jsonl", info.transcript_path.?);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), info.session_cost.?, 1e-10);
 }
 
 test "parseStdin cwd" {

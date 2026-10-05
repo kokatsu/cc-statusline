@@ -71,7 +71,12 @@ pub const StdinInfo = struct {
     context_pct: ?f64 = null,
     context_tokens: ?i64 = null,
     context_window_size: ?i64 = null,
+    session_id: ?[]const u8 = null,
     session_name: ?[]const u8 = null,
+    transcript_path: ?[]const u8 = null,
+    /// Session cumulative API cost. Unlike the transcript-derived costs, it
+    /// includes requests the transcript never records (agent hooks).
+    session_cost: ?f64 = null,
     effort_level: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     rate_limit_5h: ?RateLimitWindow = null,
