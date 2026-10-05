@@ -170,7 +170,7 @@ fn resolveConfigDir(allocator: std.mem.Allocator, claude_config_dir: ?[]const u8
     return try std.fmt.allocPrint(allocator, "{s}/.claude", .{h});
 }
 
-fn getConfigDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
+pub fn getConfigDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
     return resolveConfigDir(allocator, env.get("CLAUDE_CONFIG_DIR"), env.get("HOME"));
 }
 
@@ -960,7 +960,7 @@ fn buildTail(
     return out;
 }
 
-fn computeBurnRate(cost: f64, start_ms: i64, now_ms: i64) f64 {
+pub fn computeBurnRate(cost: f64, start_ms: i64, now_ms: i64) f64 {
     const elapsed_ms: i64 = @max(now_ms - start_ms, ms_per_min);
     const duration_min: f64 = @as(f64, @floatFromInt(elapsed_ms)) / @as(f64, @floatFromInt(ms_per_min));
     return cost / duration_min * 60.0;
@@ -1215,14 +1215,14 @@ fn logWriteCacheError(path: []const u8, err: anyerror) void {
 /// There is no libc, so no portable getpid; the awake clock in nanoseconds
 /// is as unique as two processes can be. `exclusive` then makes an actual
 /// collision a skipped write rather than a corrupt one.
-fn cacheTmpPath(buf: []u8, cp: []const u8) ?[]const u8 {
-    const ns: u64 = @bitCast(@as(i64, @intCast(Io.Clock.awake.now(g_io).nanoseconds)));
+pub fn tmpPath(io: Io, buf: []u8, cp: []const u8) ?[]const u8 {
+    const ns: u64 = @bitCast(@as(i64, @intCast(Io.Clock.awake.now(io).nanoseconds)));
     return std.fmt.bufPrint(buf, "{s}.{x}.tmp", .{ cp, ns }) catch null;
 }
 
 fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, window_end_ms: ?i64, cp: []const u8) void {
     var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_path = cacheTmpPath(&tmp_buf, cp) orelse return;
+    const tmp_path = tmpPath(g_io, &tmp_buf, cp) orelse return;
     var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{ .exclusive = true }) catch |err| {
         if (err != error.PathAlreadyExists) logWriteCacheError(tmp_path, err);
         return;
@@ -1390,6 +1390,9 @@ pub fn parseFileLifetimeCost(io: Io, allocator: std.mem.Allocator, path: []const
     var entries: std.ArrayList(TranscriptEntry) = .empty;
     var seen: DedupSet = .empty;
     parseJsonlReader(allocator, allocator, &reader.interface, &entries, &seen);
+    // The parser ends quietly on a read error; a partial sum must not pass
+    // for the file's cost.
+    if (reader.err != null) return null;
     var cost: f64 = 0;
     for (entries.items) |e| cost += entryCost(e);
     return .{ .size = @intCast(stat.size), .cost = cost };
@@ -1935,12 +1938,12 @@ test "cache keeps its day and window so a stale day still yields the window" {
     try std.testing.expectEqual(@as(?i64, window_end_ms), result.window_end_ms);
 }
 
-test "cacheTmpPath is unique per call and keeps the cache path as prefix" {
+test "tmpPath is unique per call and keeps the cache path as prefix" {
     g_io = std.testing.io;
     var a: [std.fs.max_path_bytes]u8 = undefined;
     var b: [std.fs.max_path_bytes]u8 = undefined;
-    const pa = cacheTmpPath(&a, "/x/statusline-cache.bin").?;
-    const pb = cacheTmpPath(&b, "/x/statusline-cache.bin").?;
+    const pa = tmpPath(std.testing.io, &a, "/x/statusline-cache.bin").?;
+    const pb = tmpPath(std.testing.io, &b, "/x/statusline-cache.bin").?;
     try std.testing.expect(mem.startsWith(u8, pa, "/x/statusline-cache.bin."));
     try std.testing.expect(mem.endsWith(u8, pa, ".tmp"));
     try std.testing.expect(!mem.eql(u8, pa, pb));

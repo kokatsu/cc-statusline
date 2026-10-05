@@ -6,6 +6,7 @@ const output = @import("output.zig");
 const scan = @import("scan.zig");
 const time = @import("time.zig");
 const types = @import("types.zig");
+const unlogged = @import("unlogged.zig");
 const ju = @import("json_util.zig");
 const TestTree = @import("test_tree.zig").TestTree;
 
@@ -121,6 +122,20 @@ fn parseStdin(allocator: std.mem.Allocator, data: []const u8) StdinInfo {
     }
 
     return info;
+}
+
+const Session = struct {
+    id: []const u8,
+    transcript_path: []const u8,
+    cost: f64,
+};
+
+fn sessionOf(info: StdinInfo) ?Session {
+    return .{
+        .id = info.session_id orelse return null,
+        .transcript_path = info.transcript_path orelse return null,
+        .cost = info.session_cost orelse return null,
+    };
 }
 
 // ============================================================
@@ -246,8 +261,17 @@ fn mainImpl(init: std.process.Init) !void {
 
     // Scan transcripts (or use cache)
     const resets_at_ms: ?i64 = if (stdin_info.rate_limit_5h) |rl| rl.resets_at_ms else null;
-    const scan_output = scan.scanTranscripts(io, init.environ_map, allocator, now_ms, day_start_ms, resets_at_ms, &.{});
-    const scan_result: ?types.ScanResult = if (scan_output) |o| o.scan else null;
+    // Only a call carrying the full session identity can record unlogged
+    // cost; its files are passed to the scan so their costs are current.
+    const session = sessionOf(stdin_info);
+    const session_files = if (session) |s| unlogged.sessionFiles(io, allocator, s.transcript_path) else &.{};
+    const scan_output = scan.scanTranscripts(io, init.environ_map, allocator, now_ms, day_start_ms, resets_at_ms, session_files);
+    const config_dir = scan.getConfigDir(allocator, init.environ_map) catch null;
+    const scan_result: ?types.ScanResult = if (scan_output) |o| blk: {
+        const dir = config_dir orelse break :blk o.scan;
+        if (session) |s| unlogged.record(io, allocator, dir, s.id, s.transcript_path, s.cost, session_files, o.files, now_ms);
+        break :blk unlogged.withUnlogged(io, allocator, dir, o.scan, now_ms, day_start_ms);
+    } else null;
 
     // Resolve git branch
     var branch_buf: [256]u8 = undefined;
@@ -784,5 +808,6 @@ test {
     _ = output;
     _ = scan;
     _ = time;
+    _ = unlogged;
     _ = @import("pricing.zig");
 }
