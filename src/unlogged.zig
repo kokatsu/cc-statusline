@@ -312,22 +312,29 @@ fn serializeState(w: *std.Io.Writer, state: State) !void {
     }
 }
 
+const StoredState = struct {
+    state: State,
+    /// The file's bytes, to tell whether a new state would change them.
+    bytes: []const u8,
+};
+
 fn readState(io: Io, allocator: std.mem.Allocator, path: []const u8) ?State {
     var f = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer f.close(io);
-    return readStateFile(io, allocator, f);
+    const stored = readStateFile(io, allocator, f) orelse return null;
+    return stored.state;
 }
 
-fn readStateFile(io: Io, allocator: std.mem.Allocator, f: Io.File) ?State {
+fn readStateFile(io: Io, allocator: std.mem.Allocator, f: Io.File) ?StoredState {
     var rbuf: [4096]u8 = undefined;
     var reader = f.readerStreaming(io, &rbuf);
     const content = reader.interface.allocRemaining(allocator, .limited(max_state_bytes)) catch return null;
-    return parseState(allocator, content);
+    return .{ .state = parseState(allocator, content) orelse return null, .bytes = content };
 }
 
 /// Null for a state past retention as well as a missing one, so a session
 /// seen again after that starts over like `withUnlogged` would have made it.
-fn readLiveState(io: Io, allocator: std.mem.Allocator, path: []const u8, now_ms: i64) ?State {
+fn readLiveState(io: Io, allocator: std.mem.Allocator, path: []const u8, now_ms: i64) ?StoredState {
     var f = Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
     defer f.close(io);
     const st = f.stat(io) catch return null;
@@ -341,10 +348,14 @@ fn isExpired(mtime: Io.Timestamp, now_ms: i64, max_age_ms: i64) bool {
 }
 
 /// Replaces the whole file through a rename, so a concurrent writer for the
-/// same session leaves one self-consistent state rather than a mix.
-fn writeState(io: Io, allocator: std.mem.Allocator, path: []const u8, state: State) void {
+/// same session leaves one self-consistent state rather than a mix. Skips
+/// the write when the bytes equal `current`: most calls observe an idle
+/// session, and the write dominated their added cost. The file's mtime then
+/// marks its last change, which is what retention measures.
+fn writeState(io: Io, allocator: std.mem.Allocator, path: []const u8, state: State, current: []const u8) void {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     serializeState(&aw.writer, state) catch return;
+    if (mem.eql(u8, aw.written(), current)) return;
 
     if (std.fs.path.dirname(path)) |dir| {
         Io.Dir.createDirAbsolute(io, dir, .default_dir) catch |err| switch (err) {
@@ -381,7 +392,8 @@ pub fn record(
     now_ms: i64,
 ) void {
     const path = statePath(allocator, config_dir, session_id) orelse return;
-    const prev = readLiveState(io, allocator, path, now_ms);
+    const stored = readLiveState(io, allocator, path, now_ms);
+    const prev: ?State = if (stored) |st| st.state else null;
     // A changed transcript path starts over, so files remembered under the
     // old one must not carry into `T`.
     const remembered: []const FileRecord = if (prev) |p|
@@ -390,7 +402,7 @@ pub fn record(
         &.{};
     const t = transcriptCost(io, allocator, session_files, tracked, remembered) catch return;
     const state = observe(allocator, prev, transcript_path, total, t.total, t.files, now_ms) catch return;
-    writeState(io, allocator, path, state);
+    writeState(io, allocator, path, state, if (stored) |st| st.bytes else &.{});
 }
 
 // ============================================================
@@ -735,7 +747,7 @@ fn writeTestState(io: Io, alloc: std.mem.Allocator, config_dir: []const u8, id: 
         .pending_negative = 0,
         .files = &.{},
         .increments = increments,
-    });
+    }, &.{});
 }
 
 fn realNowMs() i64 {
@@ -876,4 +888,38 @@ test "record skips an observation whose transcript fails mid-read" {
 
     const state = readState(io, a, statePath(a, tree.root, "s").?) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), state.increments.len);
+}
+
+fn stateMtimeMs(io: Io, path: []const u8) !i64 {
+    const st = try Io.Dir.cwd().statFile(io, path, .{});
+    return @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_ms));
+}
+
+test "record leaves an unchanged state file untouched" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tree = try TestTree.init(a);
+    defer tree.deinit();
+    const io = std.testing.io;
+    try tree.tmp.dir.createDirPath(io, "projects/p");
+    try writeTestFile(tree, "projects/p/s.jsonl", line_a ++ "\n");
+    const transcript = try tree.path("projects/p/s.jsonl");
+    const path = statePath(a, tree.root, "s").?;
+
+    const now_ms = realNowMs();
+    record(io, a, tree.root, "s", transcript, 0.5, sessionFiles(io, a, transcript), &.{}, now_ms);
+    // Back-date the file so a rewrite would show in its mtime.
+    const old_ms = now_ms - 3600 * 1000;
+    {
+        var f = try Io.Dir.openFileAbsolute(io, path, .{});
+        defer f.close(io);
+        try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, old_ms) * std.time.ns_per_ms) } });
+    }
+
+    record(io, a, tree.root, "s", transcript, 0.5, sessionFiles(io, a, transcript), &.{}, now_ms + 1000);
+    try std.testing.expectEqual(old_ms, try stateMtimeMs(io, path));
+
+    record(io, a, tree.root, "s", transcript, 0.75, sessionFiles(io, a, transcript), &.{}, now_ms + 2000);
+    try std.testing.expect(try stateMtimeMs(io, path) > old_ms);
 }
