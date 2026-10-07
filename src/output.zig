@@ -509,12 +509,13 @@ pub fn parseBranchMax(val: ?[]const u8) usize {
 /// has gone cold by then. Rate selection is delegated to `calculateEntryCost`
 /// so `pricing.zig` stays the single source of truth for every cost we show.
 ///
-/// Known limitation: `calculateEntryCost` picks the 200k tier from the sum of
-/// the buckets it is handed, which here is `recache_tokens_if_cold` alone. The
-/// real request also carries fresh uncached input, so a prefix just under 200k
-/// whose request crosses it is priced at the base rate. This only ever bites on
-/// `claude-sonnet-4-5` and `claude-sonnet-4`; every other model in the table
-/// leaves `input_premium` null, which makes the premium tier unreachable.
+/// Known limitation: `calculateEntryCost` picks the premium tier from the sum
+/// of the buckets it is handed, which here is `recache_tokens_if_cold` alone.
+/// The real request also carries fresh uncached input, so a prefix just under
+/// the model's `premium_threshold` whose request crosses it is priced at the
+/// base rate. This only ever bites on `claude-haiku-5-5`, `claude-sonnet-4-5`
+/// and `claude-sonnet-4`; every other model in the table leaves
+/// `input_premium` null, which makes the premium tier unreachable.
 fn recacheCost(model_id: ?[]const u8, pc: PromptCache) ?f64 {
     const tokens = pc.recache_tokens_if_cold orelse return null;
     const ttl = pc.ttl orelse return null;

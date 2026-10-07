@@ -152,6 +152,22 @@ pub const pricing_table = [_]ModelPricing{
     .{ .prefix = "claude-3-7-sonnet", .input = 3e-6, .output = 15e-6, .cache_creation_5m = 3.75e-6, .cache_creation_1h = 6e-6, .cache_read = 3e-7 },
     // Sonnet 3.5
     .{ .prefix = "claude-3-5-sonnet", .input = 3e-6, .output = 15e-6, .cache_creation_5m = 3.75e-6, .cache_creation_1h = 6e-6, .cache_read = 3e-7 },
+    // Haiku 5.5 (1M context; every rate is 5x once the prompt passes 100k
+    // tokens; no fast tier)
+    .{
+        .prefix = "claude-haiku-5-5",
+        .input = 1e-7,
+        .output = 5e-7,
+        .cache_creation_5m = 1.25e-7,
+        .cache_creation_1h = 2e-7,
+        .cache_read = 1e-8,
+        .premium_threshold = 100_000,
+        .input_premium = 5e-7,
+        .output_premium = 2.5e-6,
+        .cache_creation_5m_premium = 6.25e-7,
+        .cache_creation_1h_premium = 1e-6,
+        .cache_read_premium = 5e-8,
+    },
     // Haiku 4.5
     .{ .prefix = "claude-haiku-4-5", .input = 1e-6, .output = 5e-6, .cache_creation_5m = 1.25e-6, .cache_creation_1h = 2e-6, .cache_read = 1e-7 },
     // Haiku 3.5
@@ -603,6 +619,51 @@ test "calculateEntryCost sonnet 5.5 over 200k uses base rate and has no fast tie
     try std.testing.expectApproxEqAbs(@as(f64, 0.61), cost, 1e-10);
 }
 
+test "calculateEntryCost haiku 5.5 all five base rates" {
+    const p = findPricing("claude-haiku-5-5").?;
+    const usage = TokenUsage{
+        .input_tokens = 1000,
+        .output_tokens = 500,
+        .cache_creation_5m_input_tokens = 2000,
+        .cache_creation_1h_input_tokens = 3000,
+        .cache_read_input_tokens = 4000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 1000*1e-7 + 500*5e-7 + 2000*1.25e-7 + 3000*2e-7 + 4000*1e-8
+    // = 0.0001 + 0.00025 + 0.00025 + 0.0006 + 0.00004 = 0.00124
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00124), cost, 1e-12);
+}
+
+test "calculateEntryCost haiku 5.5 over 100k uses all five premium rates" {
+    // 150k sits between Haiku 5.5's 100k threshold and the 200k default, so
+    // this only passes if the per-model threshold is honoured.
+    const p = findPricing("claude-haiku-5-5[1m]").?;
+    const usage = TokenUsage{
+        .input_tokens = 50_000,
+        .output_tokens = 1000,
+        .cache_creation_5m_input_tokens = 30_000,
+        .cache_creation_1h_input_tokens = 20_000,
+        .cache_read_input_tokens = 50_000,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // 50_000*5e-7 + 1000*2.5e-6 + 30_000*6.25e-7 + 20_000*1e-6 + 50_000*5e-8
+    // = 0.025 + 0.0025 + 0.01875 + 0.02 + 0.0025 = 0.06875
+    try std.testing.expectApproxEqAbs(@as(f64, 0.06875), cost, 1e-12);
+}
+
+test "calculateEntryCost haiku 5.5 at exactly 100k uses base rate and has no fast tier" {
+    const p = findPricing("claude-haiku-5-5").?;
+    try std.testing.expectEqual(@as(?FastRates, null), p.fast);
+    const usage = TokenUsage{
+        .input_tokens = 100_000,
+        .output_tokens = 100,
+        .is_fast = true,
+    };
+    const cost = calculateEntryCost(p, usage);
+    // base rate: 100_000 * 1e-7 + 100 * 5e-7 = 0.01 + 0.00005 = 0.01005
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01005), cost, 1e-12);
+}
+
 test "calculateEntryCost is_fast on non-fast model falls back to standard rates" {
     // Sonnet 4.5 has no fast tier (pricing.fast == null), so is_fast=true is a
     // failsafe no-op: the entry is priced at standard rates (premium tier here
@@ -689,6 +750,8 @@ test "findPricing all model prefixes" {
         .{ .model = "claude-sonnet-4-3-20250929", .prefix = "claude-sonnet-4" },
         .{ .model = "claude-3-7-sonnet-20250219", .prefix = "claude-3-7-sonnet" },
         .{ .model = "claude-3-5-sonnet-20241022", .prefix = "claude-3-5-sonnet" },
+        .{ .model = "claude-haiku-5-5", .prefix = "claude-haiku-5-5" },
+        .{ .model = "claude-haiku-5-5[1m]", .prefix = "claude-haiku-5-5" },
         .{ .model = "claude-haiku-4-5-20251001", .prefix = "claude-haiku-4-5" },
         .{ .model = "claude-3-5-haiku-20241022", .prefix = "claude-3-5-haiku" },
     };
