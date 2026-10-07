@@ -111,10 +111,10 @@ pub const pricing_table = [_]ModelPricing{
     .{ .prefix = "claude-opus-4", .input = 15e-6, .output = 75e-6, .cache_creation_5m = 18.75e-6, .cache_creation_1h = 30e-6, .cache_read = 1.5e-6 },
     // Claude 3 Opus
     .{ .prefix = "claude-3-opus", .input = 15e-6, .output = 75e-6, .cache_creation_5m = 18.75e-6, .cache_creation_1h = 30e-6, .cache_read = 1.5e-6 },
-    // Sonnet 5.5 (1M context at standard pricing; same rates as Sonnet 5, no
-    // fast tier). Must precede "claude-sonnet-5", which would otherwise
-    // prefix-match it.
-    .{ .prefix = "claude-sonnet-5-5", .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 2e-7 },
+    // Sonnet 5.5 (1M context at standard pricing; same rates as Sonnet 5
+    // except cache reads at 0.05x base input; no fast tier). Must precede
+    // "claude-sonnet-5", which would otherwise prefix-match it.
+    .{ .prefix = "claude-sonnet-5-5", .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 1e-7 },
     // Sonnet 5 (1M context at standard pricing; $2/$10 per MTok — the launch
     // rate was made permanent, cancelling the planned rise to $3/$15)
     .{ .prefix = "claude-sonnet-5", .input = 2e-6, .output = 10e-6, .cache_creation_5m = 2.5e-6, .cache_creation_1h = 4e-6, .cache_read = 2e-7 },
@@ -600,9 +600,9 @@ test "calculateEntryCost sonnet 5.5 all five rates" {
         .cache_read_input_tokens = 4000,
     };
     const cost = calculateEntryCost(p, usage);
-    // 1000*2e-6 + 500*10e-6 + 2000*2.5e-6 + 3000*4e-6 + 4000*2e-7
-    // = 0.002 + 0.005 + 0.005 + 0.012 + 0.0008 = 0.0248
-    try std.testing.expectApproxEqAbs(@as(f64, 0.0248), cost, 1e-10);
+    // 1000*2e-6 + 500*10e-6 + 2000*2.5e-6 + 3000*4e-6 + 4000*1e-7
+    // = 0.002 + 0.005 + 0.005 + 0.012 + 0.0004 = 0.0244
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0244), cost, 1e-10);
 }
 
 test "calculateEntryCost sonnet 5.5 over 200k uses base rate and has no fast tier" {
