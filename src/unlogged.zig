@@ -15,7 +15,9 @@ const TestTree = @import("test_tree.zig").TestTree;
 pub const dir_name = "statusline-unlogged";
 const state_ext = ".bin";
 const magic = [4]u8{ 'C', 'C', 'U', 'L' };
-const version: u32 = 1;
+/// Bump it whenever the files that make up `T` change, so older states are
+/// dropped: carried over, the jump in `T` would cancel unrelated increments.
+const version: u32 = 2;
 const max_state_bytes: usize = 1 * 1024 * 1024;
 /// A writer holds its temp file for milliseconds; one older than this was
 /// left by a process killed mid-write.
@@ -137,7 +139,8 @@ fn firstObservation(
 // ============================================================
 
 /// The session's transcript files that exist now: the main transcript and
-/// `<transcript minus .jsonl>/subagents/*.jsonl`. Subagent requests are in
+/// every `.jsonl` below `<transcript minus .jsonl>/subagents/`, including
+/// workflow logs under `subagents/workflows/`. Subagent requests are in
 /// `total_cost_usd`, so leaving their files out would count them as unlogged.
 pub fn sessionFiles(io: Io, allocator: std.mem.Allocator, transcript_path: []const u8) []const scan.FileInfo {
     var files: std.ArrayList(scan.FileInfo) = .empty;
@@ -147,16 +150,25 @@ pub fn sessionFiles(io: Io, allocator: std.mem.Allocator, transcript_path: []con
 
     if (!mem.endsWith(u8, transcript_path, ".jsonl")) return files.items;
     const sub_path = std.fmt.allocPrint(allocator, "{s}/subagents", .{transcript_path[0 .. transcript_path.len - ".jsonl".len]}) catch return files.items;
-    var dir = Io.Dir.openDirAbsolute(io, sub_path, .{ .iterate = true }) catch return files.items;
+    appendLogsBelow(io, allocator, sub_path, &files);
+    return files.items;
+}
+
+fn appendLogsBelow(io: Io, allocator: std.mem.Allocator, dir_path: []const u8, files: *std.ArrayList(scan.FileInfo)) void {
+    var dir = Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return;
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
+        if (entry.kind == .directory) {
+            const child = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            appendLogsBelow(io, allocator, child, files);
+            continue;
+        }
         if (entry.kind != .file or !mem.endsWith(u8, entry.name, ".jsonl")) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
-        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ sub_path, entry.name }) catch continue;
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
         files.append(allocator, .{ .path = path, .size = @intCast(st.size) }) catch continue;
     }
-    return files.items;
 }
 
 const TranscriptCost = struct {
@@ -647,22 +659,30 @@ const line_b =
     \\{"timestamp":"2025-06-15T10:01:00Z","message":{"id":"msg_b","model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":2000,"output_tokens":200}},"requestId":"req_b"}
 ;
 
-test "sessionFiles finds the transcript and its subagents only" {
+test "sessionFiles finds the transcript and every log under its subagents" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var tree = try TestTree.init(a);
     defer tree.deinit();
-    try tree.tmp.dir.createDirPath(std.testing.io, "p/s/subagents");
+    try tree.tmp.dir.createDirPath(std.testing.io, "p/s/subagents/workflows/wf_x");
     try writeTestFile(tree, "p/s.jsonl", line_a ++ "\n");
     try writeTestFile(tree, "p/s/subagents/agent-1.jsonl", line_b ++ "\n");
     try writeTestFile(tree, "p/s/subagents/agent-1.meta.json", "{}");
+    try writeTestFile(tree, "p/s/subagents/workflows/wf_x/agent-2.jsonl", line_b ++ "\n");
     try writeTestFile(tree, "p/other.jsonl", line_b ++ "\n");
 
     const files = sessionFiles(std.testing.io, a, try tree.path("p/s.jsonl"));
-    try std.testing.expectEqual(@as(usize, 2), files.len);
+    try std.testing.expectEqual(@as(usize, 3), files.len);
     try std.testing.expectEqualStrings(try tree.path("p/s.jsonl"), files[0].path);
-    try std.testing.expectEqualStrings(try tree.path("p/s/subagents/agent-1.jsonl"), files[1].path);
+    // Directory iteration order is unspecified.
+    const want = [_][]const u8{ "p/s/subagents/agent-1.jsonl", "p/s/subagents/workflows/wf_x/agent-2.jsonl" };
+    for (want) |rel| {
+        const p = try tree.path(rel);
+        for (files[1..]) |f| {
+            if (mem.eql(u8, f.path, p)) break;
+        } else return error.TestExpectedFile;
+    }
 }
 
 test "transcriptCost prefers the scan, then the remembered value, then a parse" {
@@ -737,6 +757,95 @@ test "record writes a state the next call builds on" {
     record(std.testing.io, a, tree.root, "s", transcript, 0.5 + added + 0.3, files, &.{}, 2000);
     const second = readState(std.testing.io, a, path) orelse return error.TestUnexpectedResult;
     try std.testing.expectApproxEqAbs(@as(f64, 0.3), incrementSum(second), 1e-9);
+}
+
+test "record counts a workflow log under subagents as transcript cost" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tree = try TestTree.init(a);
+    defer tree.deinit();
+    const io = std.testing.io;
+    try tree.tmp.dir.createDirPath(io, "projects/p/s/subagents/workflows/wf_x");
+    try writeTestFile(tree, "projects/p/s.jsonl", line_a ++ "\n");
+    const transcript = try tree.path("projects/p/s.jsonl");
+    const main_cost = scan.parseFileLifetimeCost(io, a, transcript).?.cost;
+    record(io, a, tree.root, "s", transcript, main_cost, sessionFiles(io, a, transcript), &.{}, 1000);
+
+    // The workflow's request is in the total and in its own log.
+    const nested = "projects/p/s/subagents/workflows/wf_x/agent-1.jsonl";
+    try writeTestFile(tree, nested, line_b ++ "\n");
+    const nested_cost = scan.parseFileLifetimeCost(io, a, try tree.path(nested)).?.cost;
+    record(io, a, tree.root, "s", transcript, main_cost + nested_cost, sessionFiles(io, a, transcript), &.{}, 2000);
+
+    const state = readState(io, a, statePath(a, tree.root, "s").?) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), state.increments.len);
+}
+
+/// A state as the version before 2 wrote it: its `T` left out logs nested
+/// below `subagents/`, so the next `T` jumps by their lifetime cost.
+fn writeV1TestState(tree: TestTree, alloc: std.mem.Allocator, id: []const u8, transcript: []const u8, transcript_cost: f64, increments: []const Increment) !void {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    try serializeState(&aw.writer, .{
+        .transcript_path = transcript,
+        .last_total = transcript_cost + 1.1,
+        .last_transcript_cost = transcript_cost - 1,
+        .pending_negative = 0,
+        .files = &.{},
+        .increments = increments,
+    });
+    const bytes = aw.written();
+    mem.writeInt(u32, bytes[magic.len..][0..4], 1, .little);
+    try tree.tmp.dir.createDirPath(std.testing.io, dir_name);
+    try writeTestFile(tree, try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ dir_name, id, state_ext }), bytes);
+}
+
+test "withUnlogged ignores a version 1 state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tree = try TestTree.init(a);
+    defer tree.deinit();
+    const now_ms = realNowMs();
+    try writeV1TestState(tree, a, "s", "/p/s.jsonl", 1, &.{.{ .timestamp_ms = now_ms, .amount = 0.5 }});
+    const out = withUnlogged(std.testing.io, a, tree.root, .{}, now_ms, now_ms - 1000);
+    try std.testing.expectEqual(@as(f64, 0), out.today_cost);
+}
+
+test "record starts over from a version 1 state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tree = try TestTree.init(a);
+    defer tree.deinit();
+    const io = std.testing.io;
+    try tree.tmp.dir.createDirPath(io, "projects/p");
+    try writeTestFile(tree, "projects/p/s.jsonl", line_a ++ "\n");
+    const transcript = try tree.path("projects/p/s.jsonl");
+    const t = scan.parseFileLifetimeCost(io, a, transcript).?.cost;
+    const total = t + 1.1;
+    const now_ms = realNowMs();
+    const hour: i64 = 3600 * 1000;
+    const path = statePath(a, tree.root, "s").?;
+
+    // The workflow's increment has aged out: carrying the jump in `T` as
+    // pending would swallow hook cost recorded after the update.
+    try writeV1TestState(tree, a, "s", transcript, t, &.{.{ .timestamp_ms = now_ms - hour, .amount = 0.1 }});
+    record(io, a, tree.root, "s", transcript, total, sessionFiles(io, a, transcript), &.{}, now_ms);
+    record(io, a, tree.root, "s", transcript, total + 0.2, sessionFiles(io, a, transcript), &.{}, now_ms + 1000);
+    var state = readState(io, a, path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), incrementSum(state), 1e-9);
+    try std.testing.expectEqual(@as(f64, 0), state.pending_negative);
+
+    // The workflow's increment is still retained: its double count and the
+    // hook cost after it are both dropped, a one-time loss the update accepts.
+    try writeV1TestState(tree, a, "s", transcript, t, &.{
+        .{ .timestamp_ms = now_ms - 20 * hour, .amount = 1 },
+        .{ .timestamp_ms = now_ms - hour, .amount = 0.1 },
+    });
+    record(io, a, tree.root, "s", transcript, total, sessionFiles(io, a, transcript), &.{}, now_ms);
+    state = readState(io, a, path) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), state.increments.len);
 }
 
 fn writeTestState(io: Io, alloc: std.mem.Allocator, config_dir: []const u8, id: []const u8, increments: []const Increment) !void {
