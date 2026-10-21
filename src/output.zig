@@ -775,7 +775,7 @@ fn displayWidth(s: []const u8) usize {
             continue;
         }
         const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const cp = decodeUtf8(s[i..][0..len]) orelse {
+        const cp = (if (i + len <= s.len) decodeUtf8(s[i..][0..len]) else null) orelse {
             i += 1;
             continue;
         };
@@ -2533,6 +2533,11 @@ test "displayWidth upgrades VS16 and keycap sequences to emoji width" {
     try std.testing.expectEqual(@as(usize, 4), displayWidth("\xe2\x98\x80\xef\xb8\x8f\xe2\x98\x80\xef\xb8\x8f")); // ☀️☀️
     // VS15 requests text presentation: stays narrow.
     try std.testing.expectEqual(@as(usize, 1), displayWidth("\xe2\x98\x80\xef\xb8\x8e")); // ☀︎
+}
+
+test "displayWidth skips a UTF-8 sequence truncated at the end of the input" {
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("ab\xe6")); // 3-byte lead, nothing after
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("ab\xf0")); // 4-byte lead, nothing after
 }
 
 test "line 1 fits within COLUMNS with fullwidth session name" {
