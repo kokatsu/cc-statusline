@@ -241,7 +241,7 @@ const Cursor = struct {
 
     fn take(self: *Cursor, comptime T: type) ?T {
         if (self.data.len - self.pos < @sizeOf(T)) return null;
-        const Int = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const Int = @Int(.unsigned, @bitSizeOf(T));
         const v: T = @bitCast(mem.readInt(Int, self.data[self.pos..][0..@sizeOf(T)], .little));
         self.pos += @sizeOf(T);
         return v;
@@ -295,7 +295,7 @@ fn parseState(allocator: std.mem.Allocator, content: []const u8) ?State {
 
 fn writeVal(w: *std.Io.Writer, value: anytype) !void {
     const T = @TypeOf(value);
-    const Int = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Int = @Int(.unsigned, @bitSizeOf(T));
     try w.writeInt(Int, @bitCast(value), .little);
 }
 

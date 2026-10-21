@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .single_threaded = true,
             .link_libc = false,
         }),
@@ -22,9 +22,7 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
@@ -67,7 +65,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .link_libc = false,
         }),
     });
@@ -75,9 +73,7 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run benchmarks (-- --save updates baseline, -- --size=NAME filters)");
     const run_bench = b.addRunArtifact(bench);
     run_bench.addArtifactArg(exe);
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     bench_step.dependOn(&run_bench.step);
     run_bench.step.dependOn(b.getInstallStep());
 }

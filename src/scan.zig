@@ -1052,7 +1052,7 @@ const cache_header_size: usize =
     @sizeOf(u32); // file_count
 
 fn readVal(comptime T: type, data: []const u8, pos: *usize) T {
-    const Int = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Int = @Int(.unsigned, @bitSizeOf(T));
     const result: T = @bitCast(mem.readInt(Int, data[pos.*..][0..@sizeOf(T)], .little));
     pos.* += @sizeOf(T);
     return result;
@@ -1157,7 +1157,7 @@ fn readCache(allocator: std.mem.Allocator, cp: []const u8) ?CacheResult {
 
 fn writeVal(w: anytype, value: anytype) !void {
     const T = @TypeOf(value);
-    const Int = std.meta.Int(.unsigned, @bitSizeOf(T));
+    const Int = @Int(.unsigned, @bitSizeOf(T));
     var buf: [@sizeOf(T)]u8 = undefined;
     mem.writeInt(Int, &buf, @bitCast(value), .little);
     try w.writeAll(&buf);
@@ -1270,7 +1270,7 @@ pub const Phase = enum {
     write_cache,
 };
 
-pub const phase_count = std.meta.fields(Phase).len;
+pub const phase_count = @typeInfo(Phase).@"enum".field_names.len;
 
 /// Per-phase wall-clock budget for one fullScan invocation, indexed by `Phase`.
 /// Sums to ~total fullScan ns (modulo Clock.awake.now overhead, ~10-100 ns per probe).
@@ -1294,7 +1294,7 @@ pub fn benchFullScanProfiled(
 
     var ts = Io.Clock.awake.now(io);
     const file_infos = collectTranscriptFiles(allocator, projects_path, now_ms);
-    timings[@intFromEnum(Phase.collect)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
+    timings[@backingInt(Phase.collect)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
 
     var all_entries: std.ArrayList(TranscriptEntry) = .empty;
     var cache_files: std.ArrayList(CachedFileEntry) = .empty;
@@ -1315,19 +1315,19 @@ pub fn benchFullScanProfiled(
         var stack_buf: [jsonl_buf_size]u8 = undefined;
         const rbuf = jsonlReadBuf(tmp, fi.size, &stack_buf);
         var reader = f.readerStreaming(io, rbuf);
-        timings[@intFromEnum(Phase.open)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+        timings[@backingInt(Phase.open)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
 
         ts = Io.Clock.awake.now(io);
         var file_entries: std.ArrayList(TranscriptEntry) = .empty;
         parseJsonlReader(tmp, allocator, &reader.interface, &file_entries, &global_seen);
-        timings[@intFromEnum(Phase.read_parse)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+        timings[@backingInt(Phase.read_parse)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
 
         ts = Io.Clock.awake.now(io);
         const start_idx = all_entries.items.len;
         for (file_entries.items) |entry| {
             all_entries.append(allocator, entry) catch continue;
         }
-        timings[@intFromEnum(Phase.copy)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+        timings[@backingInt(Phase.copy)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
 
         ts = Io.Clock.awake.now(io);
         const new_items = all_entries.items[start_idx..];
@@ -1352,7 +1352,7 @@ pub fn benchFullScanProfiled(
             .last_entry_ts = last_ts,
             .tail = buildTail(allocator, &.{}, &global_seen.cross, new_items),
         }) catch {};
-        timings[@intFromEnum(Phase.cost)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
+        timings[@backingInt(Phase.cost)] += @intCast(ts.untilNow(io, .awake).nanoseconds);
     }
 
     ts = Io.Clock.awake.now(io);
@@ -1360,12 +1360,12 @@ pub fn benchFullScanProfiled(
         .today_cost = total_today_cost,
         .block = computeBlock(all_entries.items, now_ms, null),
     };
-    timings[@intFromEnum(Phase.block)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
+    timings[@backingInt(Phase.block)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
 
     ts = Io.Clock.awake.now(io);
     const cf = cache_files.toOwnedSlice(allocator) catch &.{};
     writeCache(result, cf, now_s, now_s, day_start_ms, null, cp);
-    timings[@intFromEnum(Phase.write_cache)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
+    timings[@backingInt(Phase.write_cache)] = @intCast(ts.untilNow(io, .awake).nanoseconds);
 
     return result;
 }
@@ -1972,7 +1972,7 @@ test "writeCache leaves only the renamed cache behind" {
 }
 
 test "cache invalid magic" {
-    var data: [cache_header_size]u8 = .{0} ** cache_header_size;
+    var data: [cache_header_size]u8 = @splat(0);
     @memcpy(data[0..4], "NOPE");
     try std.testing.expectEqual(@as(?CacheResult, null), parseCacheBytes(std.testing.allocator, &data));
 }
@@ -1983,7 +1983,7 @@ test "cache too short" {
 }
 
 test "cache wrong version" {
-    var data: [cache_header_size]u8 = .{0} ** cache_header_size;
+    var data: [cache_header_size]u8 = @splat(0);
     @memcpy(data[0..4], &cache_magic);
     // Write a different version (cache_ver + 1)
     mem.writeInt(u32, data[4..8], cache_ver + 1, .little);

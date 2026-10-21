@@ -2187,7 +2187,7 @@ test "layoutForWindows three windows is never wider than two at the same COLUMNS
         const two = layoutForColumns(cols);
         const three = layoutForWindows(cols, 3, 5);
         try std.testing.expect(three.bar_width <= two.bar_width);
-        try std.testing.expect(@intFromEnum(three.reset_info) >= @intFromEnum(two.reset_info));
+        try std.testing.expect(@backingInt(three.reset_info) >= @backingInt(two.reset_info));
     }
 }
 
@@ -2579,7 +2579,10 @@ test "line 1 fits within COLUMNS with supplementary wide session name" {
         theme.reset_info = layout.reset_info;
         theme.cols = cols;
         var info = worstCaseLine1Info("Sonnet 4.5", null);
-        info.session_name = "\xf0\x96\xbf\xa0" ** 8; // U+16FE0 × 8
+        info.session_name = comptime name: {
+            const buf: [8][4]u8 = @splat("\xf0\x96\xbf\xa0".*);
+            break :name @ptrCast(&buf);
+        }; // U+16FE0 × 8
         try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
         var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
         const line = it.next() orelse "";
@@ -2628,7 +2631,10 @@ test "line 1 fits within COLUMNS with VS16-emoji session name" {
         theme.reset_info = layout.reset_info;
         theme.cols = cols;
         var info = worstCaseLine1Info("Sonnet 4.5", null);
-        info.session_name = "☀️" ** 6;
+        info.session_name = comptime name: {
+            const buf: [6][6]u8 = @splat("☀️".*);
+            break :name @ptrCast(&buf);
+        };
         try printOutput(&aw.writer, theme, info, null, 0, 0, worst_case_branch);
         var it = mem.splitScalar(u8, aw.writer.buffered(), '\n');
         const line = it.next() orelse "";

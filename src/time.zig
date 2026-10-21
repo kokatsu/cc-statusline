@@ -528,17 +528,17 @@ test "formatLocalDateTime drops sub-second precision" {
 
 test "parseTzif v2 fixed offset" {
     const header_size = 44;
-    var v1_header: [header_size]u8 = .{0} ** header_size;
+    var v1_header: [header_size]u8 = @splat(0);
     @memcpy(v1_header[0..4], "TZif");
     v1_header[4] = '2';
     v1_header[39] = 1;
     v1_header[43] = 4;
 
-    var v1_type: [6]u8 = .{0} ** 6;
+    var v1_type: [6]u8 = @splat(0);
     std.mem.writeInt(u32, v1_type[0..4], @bitCast(@as(i32, 32400)), .big);
     const v1_abbr = [4]u8{ 'J', 'S', 'T', 0 };
 
-    var v2_header: [header_size]u8 = .{0} ** header_size;
+    var v2_header: [header_size]u8 = @splat(0);
     @memcpy(v2_header[0..4], "TZif");
     v2_header[4] = '2';
     v2_header[39] = 1;
@@ -566,7 +566,7 @@ test "parseTzif v2 fixed offset" {
 test "parseTzif invalid data" {
     try std.testing.expectEqual(@as(?i32, null), parseTzif("", 0));
     try std.testing.expectEqual(@as(?i32, null), parseTzif("short", 0));
-    var bad: [44]u8 = .{0} ** 44;
+    var bad: [44]u8 = @splat(0);
     @memcpy(bad[0..4], "NOPE");
     try std.testing.expectEqual(@as(?i32, null), parseTzif(&bad, 0));
 }
@@ -580,7 +580,7 @@ test "parseTzif reads /etc/localtime" {
 
 test "parseTzif v1 format" {
     const header_size = 44;
-    var data: [header_size + 10]u8 = .{0} ** (header_size + 10);
+    var data: [header_size + 10]u8 = @splat(0);
     @memcpy(data[0..4], "TZif");
     data[4] = 0;
     std.mem.writeInt(u32, data[36..40], 1, .big);
@@ -597,7 +597,7 @@ test "parseTzif v1 format" {
 }
 
 test "parseTzifData with transition table" {
-    var data: [128]u8 = .{0} ** 128;
+    var data: [128]u8 = @splat(0);
     const timecnt: u32 = 2;
     const typecnt: u32 = 2;
 

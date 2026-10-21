@@ -776,7 +776,7 @@ test "readGitHead accepts a HEAD that exactly fills the buffer and rejects a lon
     const path = try tree.path("HEAD");
     const prefix = "ref: refs/heads/";
     // prefix (16) + 239 + "\n" = 256 bytes, the buffer size exactly.
-    const exact = prefix ++ ("b" ** 239) ++ "\n";
+    const exact = prefix ++ @as([239]u8, @splat('b')) ++ "\n";
     comptime std.debug.assert(exact.len == 256);
     {
         var f = try tree.tmp.dir.createFile(io, "HEAD", .{});
@@ -784,11 +784,11 @@ test "readGitHead accepts a HEAD that exactly fills the buffer and rejects a lon
         try f.writeStreamingAll(io, exact);
     }
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("b" ** 239, readGitHead(io, &buf, path).?);
+    try std.testing.expectEqualStrings(&@as([239]u8, @splat('b')), readGitHead(io, &buf, path).?);
     {
         var f = try tree.tmp.dir.createFile(io, "HEAD", .{});
         defer f.close(io);
-        try f.writeStreamingAll(io, prefix ++ ("b" ** 240) ++ "\n");
+        try f.writeStreamingAll(io, prefix ++ @as([240]u8, @splat('b')) ++ "\n");
     }
     try std.testing.expectEqual(@as(?[]const u8, null), readGitHead(io, &buf, path));
 }

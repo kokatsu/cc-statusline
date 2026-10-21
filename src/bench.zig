@@ -8,6 +8,7 @@
 //! Run with: `zig build bench` (also accepts -- --save / --baseline).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const json = std.json;
 const scan = @import("scan.zig");
@@ -518,7 +519,7 @@ fn writeRow(w: *Io.Writer, label: []const u8, s: Stats, base_median: ?u64) !void
 }
 
 fn printResults(w: *Io.Writer, results: []const Result, baseline: ?BaselineMap) !void {
-    try w.print("\n  cc-statusline benchmark — zig 0.16.0\n", .{});
+    try w.print("\n  cc-statusline benchmark — zig {s}\n", .{builtin.zig_version_string});
     try w.print("  iters: {d} measured (+{d} warmup)\n\n", .{ default_iters, warmup_iters });
 
     for (results) |r| {
@@ -561,9 +562,9 @@ fn phaseLabel(p: scan.Phase) []const u8 {
 fn printPhaseBreakdown(w: *Io.Writer, total: Stats, p: PhaseStats) !void {
     try w.writeAll("    fullScan phase breakdown (median)\n");
     try w.writeAll("    ────────────────────────────────────────────────────────────\n");
-    inline for (std.meta.fields(scan.Phase)) |f| {
-        const phase: scan.Phase = @enumFromInt(f.value);
-        try writePhaseRow(w, phaseLabel(phase), p[f.value], total.median_ns);
+    inline for (@typeInfo(scan.Phase).@"enum".field_values) |value| {
+        const phase: scan.Phase = @fromBackingInt(value);
+        try writePhaseRow(w, phaseLabel(phase), p[value], total.median_ns);
     }
 }
 

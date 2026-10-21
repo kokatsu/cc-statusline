@@ -19,7 +19,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 
 ## Requirements
 
-- Zig 0.16.0+
+- Zig 0.17.0+
 
 ## Build
 
