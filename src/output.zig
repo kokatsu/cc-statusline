@@ -309,23 +309,23 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
 pub fn formatCurrency(buf: []u8, value: f64) []const u8 {
     if (value < 0) return "$0.00";
     if (value > 0 and value < 0.01) {
-        return std.fmt.bufPrint(buf, "${d:.4}", .{value}) catch "$?.??";
+        return mem.print(buf, "${d:.4}", .{value}) catch "$?.??";
     }
-    return std.fmt.bufPrint(buf, "${d:.2}", .{value}) catch "$?.??";
+    return mem.print(buf, "${d:.2}", .{value}) catch "$?.??";
 }
 
 pub fn formatTokens(buf: []u8, tokens: i64) []const u8 {
     if (tokens < 1000) {
-        return std.fmt.bufPrint(buf, "{d}", .{tokens}) catch "?";
+        return mem.print(buf, "{d}", .{tokens}) catch "?";
     }
     if (tokens < 1_000_000) {
-        return std.fmt.bufPrint(buf, "{d}k", .{@divFloor(tokens, 1000)}) catch "?";
+        return mem.print(buf, "{d}k", .{@divFloor(tokens, 1000)}) catch "?";
     }
     if (@rem(tokens, 1_000_000) == 0) {
-        return std.fmt.bufPrint(buf, "{d}M", .{@divFloor(tokens, 1_000_000)}) catch "?";
+        return mem.print(buf, "{d}M", .{@divFloor(tokens, 1_000_000)}) catch "?";
     }
     const millions = @as(f64, @floatFromInt(tokens)) / 1_000_000.0;
-    return std.fmt.bufPrint(buf, "{d:.1}M", .{millions}) catch "?";
+    return mem.print(buf, "{d:.1}M", .{millions}) catch "?";
 }
 
 fn thresholdColor(theme: Theme, value: f64, yellow: f64, red: f64) []const u8 {
@@ -409,12 +409,24 @@ pub fn formatResetDuration(buf: []u8, remaining_ms: i64) []const u8 {
     if (total_hours >= 24) {
         const days = @divFloor(total_hours, @as(i64, 24));
         const hours = total_hours - days * 24;
-        return std.fmt.bufPrint(buf, "{d}d {d}h", .{ days, hours }) catch "??";
+        return mem.print(buf, "{d}d {d}h", .{ days, hours }) catch "??";
     }
     if (total_hours > 0) {
-        return std.fmt.bufPrint(buf, "{d}h {d}m", .{ total_hours, mins }) catch "??";
+        return mem.print(buf, "{d}h {d}m", .{ total_hours, mins }) catch "??";
     }
-    return std.fmt.bufPrint(buf, "{d}m", .{mins}) catch "??";
+    return mem.print(buf, "{d}m", .{mins}) catch "??";
+}
+
+/// Decode one UTF-8 sequence; `bytes.len` must be the length announced by its
+/// first byte.
+fn decodeUtf8(bytes: []const u8) ?u21 {
+    return switch (bytes.len) {
+        1 => bytes[0],
+        2 => std.unicode.utf8Decode2(bytes[0..2].*) catch null,
+        3 => std.unicode.utf8Decode3(bytes[0..3].*) catch null,
+        4 => std.unicode.utf8Decode4(bytes[0..4].*) catch null,
+        else => unreachable,
+    };
 }
 
 const LastCodepoint = struct { cp: u21, start: usize };
@@ -427,7 +439,7 @@ fn lastCodepoint(s: []const u8) ?LastCodepoint {
     while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
     const len = std.unicode.utf8ByteSequenceLength(s[start]) catch return null;
     if (start + len != s.len) return null;
-    const cp = std.unicode.utf8Decode(s[start..]) catch return null;
+    const cp = decodeUtf8(s[start..]) orelse return null;
     return .{ .cp = cp, .start = start };
 }
 
@@ -437,7 +449,7 @@ fn codepointAt(s: []const u8, i: usize) ?u21 {
     if (i >= s.len) return null;
     const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return null;
     if (i + len > s.len) return null;
-    return std.unicode.utf8Decode(s[i..][0..len]) catch null;
+    return decodeUtf8(s[i..][0..len]);
 }
 
 fn isRegionalIndicator(cp: u21) bool {
@@ -611,7 +623,7 @@ fn writeRateLimitWindow(w: *Writer, theme: Theme, label: []const u8, rl: RateLim
 /// limit has no upper bound, so 1000% and up cost extra.
 fn pctExtraCols(pct: f64) u16 {
     var buf: [32]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&buf, "{d:.0}%", .{pct}) catch return 0;
+    const rendered = mem.print(&buf, "{d:.0}%", .{pct}) catch return 0;
     return @intCast(rendered.len -| 4);
 }
 
@@ -763,7 +775,7 @@ fn displayWidth(s: []const u8) usize {
             continue;
         }
         const len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        const cp = std.unicode.utf8Decode(s[i..][0..len]) catch {
+        const cp = decodeUtf8(s[i..][0..len]) orelse {
             i += 1;
             continue;
         };
@@ -1021,7 +1033,7 @@ pub fn printFallback(w: *Writer) void {
 // ============================================================
 
 fn contains(haystack: []const u8, needle: []const u8) bool {
-    return mem.indexOf(u8, haystack, needle) != null;
+    return mem.find(u8, haystack, needle) != null;
 }
 
 fn countNewlines(data: []const u8) usize {
@@ -1357,7 +1369,7 @@ test "printOutput line1 effort level colored per level" {
             try printOutput(&aw.writer, theme, info, null, 0, 0, null);
             var expected_buf: [64]u8 = undefined;
             // ⚡ U+26A1
-            const expected = try std.fmt.bufPrint(&expected_buf, "{s}\xe2\x9a\xa1{s}", .{ case.color, case.level });
+            const expected = try mem.print(&expected_buf, "{s}\xe2\x9a\xa1{s}", .{ case.color, case.level });
             try std.testing.expect(contains(aw.writer.buffered(), expected));
         }
     }
@@ -1824,7 +1836,7 @@ test "printOutput line3 both rate limits with separator" {
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var i: usize = 0;
-    while (mem.indexOfPos(u8, haystack, i, needle)) |pos| : (i = pos + needle.len) count += 1;
+    while (mem.findPos(u8, haystack, i, needle)) |pos| : (i = pos + needle.len) count += 1;
     return count;
 }
 
@@ -1855,7 +1867,7 @@ test "printOutput line3 three windows carry two dividers" {
     };
     try printOutput(&aw.writer, theme_default, info, null, 0, 0, null);
     const out = aw.writer.buffered();
-    const line3 = out[mem.lastIndexOfScalar(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
+    const line3 = out[mem.findScalarLast(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
     try std.testing.expectEqual(@as(usize, 2), countOccurrences(line3, theme_default.dim ++ "|" ++ theme_default.reset));
     try std.testing.expect(contains(line3, "\xf0\x9f\x95\x94 ")); // 🕔
     try std.testing.expect(contains(line3, "\xf0\x9f\x93\x85 ")); // 📅
@@ -1888,7 +1900,7 @@ test "printOutput line3 a five-digit spend percentage is budgeted into the layou
     defer aw.deinit();
     try printOutput(&aw.writer, theme, info, null, 0, 0, null);
     const out = aw.writer.buffered();
-    const line3 = out[mem.lastIndexOfScalar(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
+    const line3 = out[mem.findScalarLast(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
     try std.testing.expect(contains(line3, "1000%"));
     try std.testing.expect(displayWidth(line3) <= 95);
     try std.testing.expect(!contains(line3, "01/01"));
@@ -1910,7 +1922,7 @@ test "printOutput line3 three windows narrow the layout to fit COLUMNS" {
     defer aw.deinit();
     try printOutput(&aw.writer, theme, info, null, 0, 0, null);
     const out = aw.writer.buffered();
-    const line3 = out[mem.lastIndexOfScalar(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
+    const line3 = out[mem.findScalarLast(u8, out[0 .. out.len - 1], '\n').? + 1 ..];
     try std.testing.expect(displayWidth(line3) <= 85);
     try std.testing.expect(!contains(line3, theme.bar_filled));
     try std.testing.expect(contains(line3, "1h 0m"));

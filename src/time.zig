@@ -5,7 +5,7 @@ const Io = std.Io;
 pub fn formatLocalDateTime(buf: []u8, epoch_ms: i64, utc_offset_s: i32) []const u8 {
     const local_s = @divFloor(epoch_ms, @as(i64, 1000)) + @as(i64, utc_offset_s);
     const c = epochToCivil(local_s);
-    return std.fmt.bufPrint(buf, "{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}", .{ c.month, c.day, c.hour, c.minute }) catch "??";
+    return mem.print(buf, "{d:0>2}/{d:0>2} {d:0>2}:{d:0>2}", .{ c.month, c.day, c.hour, c.minute }) catch "??";
 }
 
 // ============================================================
@@ -114,7 +114,7 @@ pub fn getUtcOffsetSeconds(io: Io, env_map: *const std.process.Environ.Map, allo
         }
 
         var buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "/usr/share/zoneinfo/{s}", .{tz}) catch null;
+        const path = mem.print(&buf, "/usr/share/zoneinfo/{s}", .{tz}) catch null;
         if (path) |p| {
             if (readTzifOffset(io, allocator, p, now_s)) |off| return off;
         }
@@ -134,7 +134,7 @@ fn parsePosixTzFixed(tz: []const u8) ?i32 {
     var i: usize = 0;
 
     if (tz[0] == '<') {
-        const end = mem.indexOfScalarPos(u8, tz, 1, '>') orelse return null;
+        const end = mem.findScalarPos(u8, tz, 1, '>') orelse return null;
         i = end + 1;
     } else {
         while (i < tz.len and std.ascii.isAlphabetic(tz[i])) : (i += 1) {}

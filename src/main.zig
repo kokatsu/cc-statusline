@@ -149,7 +149,7 @@ fn getGitBranch(io: std.Io, buf: *[256]u8, cwd: []const u8) ?[]const u8 {
         if (readBranchAt(io, buf, dir)) |branch| return branch;
 
         // Move to parent directory
-        const sep = mem.lastIndexOfScalar(u8, dir, '/') orelse return null;
+        const sep = mem.findScalarLast(u8, dir, '/') orelse return null;
         if (sep == 0) return readBranchAt(io, buf, "");
         dir = dir[0..sep];
     }
@@ -161,19 +161,19 @@ fn getGitBranch(io: std.Io, buf: *[256]u8, cwd: []const u8) ?[]const u8 {
 /// followed to `<gitdir>/HEAD`.
 fn readBranchAt(io: std.Io, buf: *[256]u8, dir: []const u8) ?[]const u8 {
     var path_buf: [4096]u8 = undefined;
-    const head_path = std.fmt.bufPrint(&path_buf, "{s}/.git/HEAD", .{dir}) catch return null;
+    const head_path = mem.print(&path_buf, "{s}/.git/HEAD", .{dir}) catch return null;
     if (readGitHead(io, buf, head_path)) |branch| return branch;
 
-    const dotgit_path = std.fmt.bufPrint(&path_buf, "{s}/.git", .{dir}) catch return null;
+    const dotgit_path = mem.print(&path_buf, "{s}/.git", .{dir}) catch return null;
     var pointer_buf: [4096]u8 = undefined;
     const pointer = readSmallFile(io, &pointer_buf, dotgit_path) orelse return null;
     const gitdir = parseGitdirPointer(pointer) orelse return null;
     // `worktree.useRelativePaths` (and submodules) write the pointer relative
     // to the directory holding the `.git` file.
     const wt_head_path = if (gitdir[0] == '/')
-        std.fmt.bufPrint(&path_buf, "{s}/HEAD", .{gitdir}) catch return null
+        mem.print(&path_buf, "{s}/HEAD", .{gitdir}) catch return null
     else
-        std.fmt.bufPrint(&path_buf, "{s}/{s}/HEAD", .{ dir, gitdir }) catch return null;
+        mem.print(&path_buf, "{s}/{s}/HEAD", .{ dir, gitdir }) catch return null;
     return readGitHead(io, buf, wt_head_path);
 }
 

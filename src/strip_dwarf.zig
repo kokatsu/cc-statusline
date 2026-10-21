@@ -123,7 +123,7 @@ fn findDebugLineSection(data: []const u8) ?SectionInfo {
         const sh_name = mem.readInt(u32, data[sh_off..][0..4], .little);
         if (sh_name >= shstrtab.len) continue;
 
-        const name_end = mem.indexOfScalar(u8, shstrtab[sh_name..], 0) orelse continue;
+        const name_end = mem.findScalar(u8, shstrtab[sh_name..], 0) orelse continue;
         const name = shstrtab[sh_name..][0..name_end];
         if (!mem.eql(u8, name, debug_line_name)) continue;
 

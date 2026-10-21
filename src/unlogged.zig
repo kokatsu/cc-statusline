@@ -149,7 +149,7 @@ pub fn sessionFiles(io: Io, allocator: std.mem.Allocator, transcript_path: []con
     } else |_| {}
 
     if (!mem.endsWith(u8, transcript_path, ".jsonl")) return files.items;
-    const sub_path = std.fmt.allocPrint(allocator, "{s}/subagents", .{transcript_path[0 .. transcript_path.len - ".jsonl".len]}) catch return files.items;
+    const sub_path = allocator.print("{s}/subagents", .{transcript_path[0 .. transcript_path.len - ".jsonl".len]}) catch return files.items;
     appendLogsBelow(io, allocator, sub_path, &files);
     return files.items;
 }
@@ -160,13 +160,13 @@ fn appendLogsBelow(io: Io, allocator: std.mem.Allocator, dir_path: []const u8, f
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (entry.kind == .directory) {
-            const child = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            const child = allocator.print("{s}/{s}", .{ dir_path, entry.name }) catch continue;
             appendLogsBelow(io, allocator, child, files);
             continue;
         }
         if (entry.kind != .file or !mem.endsWith(u8, entry.name, ".jsonl")) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
-        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const path = allocator.print("{s}/{s}", .{ dir_path, entry.name }) catch continue;
         files.append(allocator, .{ .path = path, .size = @intCast(st.size) }) catch continue;
     }
 }
@@ -232,7 +232,7 @@ pub fn statePath(allocator: std.mem.Allocator, config_dir: []const u8, session_i
     for (session_id) |ch| {
         if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_') return null;
     }
-    return std.fmt.allocPrint(allocator, "{s}/{s}/{s}{s}", .{ config_dir, dir_name, session_id, state_ext }) catch null;
+    return allocator.print("{s}/{s}/{s}{s}", .{ config_dir, dir_name, session_id, state_ext }) catch null;
 }
 
 const Cursor = struct {
@@ -369,13 +369,13 @@ fn writeState(io: Io, allocator: std.mem.Allocator, path: []const u8, state: Sta
     serializeState(&aw.writer, state) catch return;
     if (mem.eql(u8, aw.written(), current)) return;
 
-    if (std.fs.path.dirname(path)) |dir| {
+    if (Io.Dir.path.dirname(path)) |dir| {
         Io.Dir.createDirAbsolute(io, dir, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return,
         };
     }
-    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const tmp = scan.tmpPath(io, &tmp_buf, path) orelse return;
     var f = Io.Dir.createFileAbsolute(io, tmp, .{ .exclusive = true }) catch return;
     const written = blk: {
@@ -426,7 +426,7 @@ pub fn record(
 /// has written for `retention_ms` and temp files abandoned mid-write, so
 /// stdin-less callers keep the directory bounded too.
 pub fn withUnlogged(io: Io, allocator: std.mem.Allocator, config_dir: []const u8, result: types.ScanResult, now_ms: i64, day_start_ms: i64) types.ScanResult {
-    const dir_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, dir_name }) catch return result;
+    const dir_path = allocator.print("{s}/{s}", .{ config_dir, dir_name }) catch return result;
     var dir = Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return result;
     defer dir.close(io);
 
@@ -445,7 +445,7 @@ pub fn withUnlogged(io: Io, allocator: std.mem.Allocator, config_dir: []const u8
         }
         if (is_tmp) continue;
 
-        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const path = allocator.print("{s}/{s}", .{ dir_path, entry.name }) catch continue;
         const state = readState(io, allocator, path) orelse continue;
         for (state.increments) |inc| {
             if (inc.timestamp_ms >= day_start_ms) today += inc.amount;
@@ -797,7 +797,7 @@ fn writeV1TestState(tree: TestTree, alloc: std.mem.Allocator, id: []const u8, tr
     const bytes = aw.written();
     mem.writeInt(u32, bytes[magic.len..][0..4], 1, .little);
     try tree.tmp.dir.createDirPath(std.testing.io, dir_name);
-    try writeTestFile(tree, try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{ dir_name, id, state_ext }), bytes);
+    try writeTestFile(tree, try alloc.print("{s}/{s}{s}", .{ dir_name, id, state_ext }), bytes);
 }
 
 test "withUnlogged ignores a version 1 state" {

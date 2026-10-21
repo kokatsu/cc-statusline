@@ -162,12 +162,12 @@ fn resolveConfigDir(allocator: std.mem.Allocator, claude_config_dir: ?[]const u8
     // failure in Debug, cwd-relative I/O in ReleaseFast. Reject it here so the
     // statusline degrades to "no scan data" instead.
     if (claude_config_dir) |dir| {
-        if (!std.fs.path.isAbsolute(dir)) return error.RelativeConfigDir;
+        if (!Io.Dir.path.isAbsolute(dir)) return error.RelativeConfigDir;
         return try allocator.dupe(u8, dir);
     }
     const h = home orelse return error.NoHome;
-    if (!std.fs.path.isAbsolute(h)) return error.RelativeConfigDir;
-    return try std.fmt.allocPrint(allocator, "{s}/.claude", .{h});
+    if (!Io.Dir.path.isAbsolute(h)) return error.RelativeConfigDir;
+    return try allocator.print("{s}/.claude", .{h});
 }
 
 pub fn getConfigDir(allocator: std.mem.Allocator, env: *const std.process.Environ.Map) ![]const u8 {
@@ -184,7 +184,7 @@ fn logOpendirError(path: []const u8, err: anyerror) void {
     // Permission / I/O errors are not, so surface them for debugging.
     if (err == error.FileNotFound) return;
     var buf: [512]u8 = undefined;
-    if (std.fmt.bufPrint(&buf, "cc-statusline: opendir {s} failed: {s}\n", .{ path, @errorName(err) })) |msg| {
+    if (mem.print(&buf, "cc-statusline: opendir {s} failed: {s}\n", .{ path, @errorName(err) })) |msg| {
         Io.File.stderr().writeStreamingAll(g_io, msg) catch {};
     } else |_| {}
 }
@@ -199,11 +199,11 @@ fn collectTranscriptFiles(allocator: std.mem.Allocator, projects_path: []const u
     };
     defer projects_dir.close(g_io);
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     var proj_it = projects_dir.iterate();
     while (proj_it.next(g_io) catch null) |proj_entry| {
         if (proj_entry.kind != .directory) continue;
-        const proj_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ projects_path, proj_entry.name }) catch continue;
+        const proj_path = mem.print(&path_buf, "{s}/{s}", .{ projects_path, proj_entry.name }) catch continue;
         scanDirRecursive(allocator, proj_path, &files, cutoff_ms);
     }
 
@@ -219,11 +219,11 @@ fn scanDirRecursive(allocator: std.mem.Allocator, dir_path: []const u8, files: *
 
     // Reused for child paths each iteration. Safe across the recursive call
     // because the callee finishes before we touch the buffer again.
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     var it = dir.iterate();
     while (it.next(g_io) catch null) |entry| {
         if (entry.kind == .directory) {
-            const sub_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            const sub_path = mem.print(&path_buf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
             scanDirRecursive(allocator, sub_path, files, cutoff_ms);
         } else if (entry.kind == .file and mem.endsWith(u8, entry.name, ".jsonl")) {
             const stat = dir.statFile(g_io, entry.name, .{}) catch continue;
@@ -231,7 +231,7 @@ fn scanDirRecursive(allocator: std.mem.Allocator, dir_path: []const u8, files: *
             const mtime_ms: i64 = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_ms));
             if (mtime_ms < cutoff_ms) continue;
 
-            const abs_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            const abs_path = allocator.print("{s}/{s}", .{ dir_path, entry.name }) catch continue;
             files.append(allocator, .{ .path = abs_path, .size = @intCast(stat.size) }) catch continue;
         }
     }
@@ -294,7 +294,7 @@ fn handleLine(
     seen: *DedupSet,
 ) void {
     if (line.len == 0) return;
-    if (mem.indexOf(u8, line, usage_marker) == null) return;
+    if (mem.find(u8, line, usage_marker) == null) return;
     parseJsonlLine(allocator, dedup_alloc, line, entries, seen) catch {};
 }
 
@@ -388,7 +388,7 @@ const SaxScanner = struct {
         if (self.cursor >= self.input.len or self.input[self.cursor] != '"')
             return error.UnexpectedToken;
         self.cursor += 1;
-        const end = mem.indexOfScalarPos(u8, self.input, self.cursor, '"') orelse
+        const end = mem.findScalarPos(u8, self.input, self.cursor, '"') orelse
             return error.UnexpectedEndOfInput;
         const key = self.input[self.cursor..end];
         self.cursor = end + 1;
@@ -1204,7 +1204,7 @@ fn logWriteCacheError(path: []const u8, err: anyerror) void {
     // render pays a full scan), so surface them for debugging.
     if (err == error.FileNotFound) return;
     var buf: [512]u8 = undefined;
-    if (std.fmt.bufPrint(&buf, "cc-statusline: write cache {s} failed: {s}\n", .{ path, @errorName(err) })) |msg| {
+    if (mem.print(&buf, "cc-statusline: write cache {s} failed: {s}\n", .{ path, @errorName(err) })) |msg| {
         Io.File.stderr().writeStreamingAll(g_io, msg) catch {};
     } else |_| {}
 }
@@ -1217,11 +1217,11 @@ fn logWriteCacheError(path: []const u8, err: anyerror) void {
 /// collision a skipped write rather than a corrupt one.
 pub fn tmpPath(io: Io, buf: []u8, cp: []const u8) ?[]const u8 {
     const ns: u64 = @bitCast(@as(i64, @intCast(Io.Clock.awake.now(io).nanoseconds)));
-    return std.fmt.bufPrint(buf, "{s}.{x}.tmp", .{ cp, ns }) catch null;
+    return mem.print(buf, "{s}.{x}.tmp", .{ cp, ns }) catch null;
 }
 
 fn writeCache(result: ScanResult, files: []const CachedFileEntry, now_s: i64, last_full_scan_s: i64, day_start_ms: i64, window_end_ms: ?i64, cp: []const u8) void {
-    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const tmp_path = tmpPath(g_io, &tmp_buf, cp) orelse return;
     var f = Io.Dir.createFileAbsolute(g_io, tmp_path, .{ .exclusive = true }) catch |err| {
         if (err != error.PathAlreadyExists) logWriteCacheError(tmp_path, err);
@@ -1426,8 +1426,8 @@ fn planWindow(cached_window_ms: ?i64, resets_at_ms: ?i64, now_ms: i64) WindowPla
 pub fn scanTranscripts(io: Io, env: *const std.process.Environ.Map, allocator: std.mem.Allocator, now_ms: i64, day_start_ms: i64, resets_at_ms: ?i64, fresh: []const FileInfo) ?ScanOutput {
     g_io = io;
     const config_dir = getConfigDir(allocator, env) catch return null;
-    const projects_path = std.fmt.allocPrint(allocator, "{s}/projects", .{config_dir}) catch return null;
-    const cp = std.fmt.allocPrint(allocator, "{s}/{s}", .{ config_dir, cache_name }) catch return null;
+    const projects_path = allocator.print("{s}/projects", .{config_dir}) catch return null;
+    const cp = allocator.print("{s}/{s}", .{ config_dir, cache_name }) catch return null;
     const now_s = @divFloor(now_ms, @as(i64, 1000));
 
     var reset_ms = resets_at_ms;
@@ -1940,8 +1940,8 @@ test "cache keeps its day and window so a stale day still yields the window" {
 
 test "tmpPath is unique per call and keeps the cache path as prefix" {
     g_io = std.testing.io;
-    var a: [std.fs.max_path_bytes]u8 = undefined;
-    var b: [std.fs.max_path_bytes]u8 = undefined;
+    var a: [Io.Dir.max_path_bytes]u8 = undefined;
+    var b: [Io.Dir.max_path_bytes]u8 = undefined;
     const pa = tmpPath(std.testing.io, &a, "/x/statusline-cache.bin").?;
     const pb = tmpPath(std.testing.io, &b, "/x/statusline-cache.bin").?;
     try std.testing.expect(mem.startsWith(u8, pa, "/x/statusline-cache.bin."));
@@ -2144,8 +2144,7 @@ test "parseJsonlReader recovers lines exceeding the reader buffer" {
 
     const padding = try alloc.alloc(u8, 4096);
     @memset(padding, 'x');
-    const line = try std.fmt.allocPrint(
-        alloc,
+    const line = try alloc.print(
         "{{\"timestamp\":\"2025-06-15T10:00:00Z\",\"requestId\":\"r1\",\"message\":{{\"id\":\"m1\",\"model\":\"claude-sonnet-4-5\",\"usage\":{{\"input_tokens\":100,\"output_tokens\":50}}}},\"pad\":\"{s}\"}}\n",
         .{padding},
     );
@@ -2330,7 +2329,7 @@ test "diffScan file grew recalculates cost" {
         \\{"timestamp":"2025-06-15T10:00:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
     ;
     var full_buf: [512]u8 = undefined;
-    const full_content = std.fmt.bufPrint(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
+    const full_content = mem.print(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
     try createTmpFile(path, full_content);
 
     const old_size: i64 = @intCast(old_content.len);
@@ -2403,7 +2402,7 @@ test "diffScan falls through to fullScan when cached block is null and new entri
         \\{"timestamp":"2025-06-15T11:30:00Z","message":{"model":"claude-sonnet-4-5-20250929","usage":{"input_tokens":1000,"output_tokens":500}}}
     ;
     var full_buf: [512]u8 = undefined;
-    const full_content = std.fmt.bufPrint(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
+    const full_content = mem.print(&full_buf, "{s}{s}\n", .{ old_content, new_line }) catch unreachable;
     try createTmpFile(path, full_content);
 
     const old_size: i64 = @intCast(old_content.len);

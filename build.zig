@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
 
     const bench_step = b.step("bench", "Run benchmarks (-- --save updates baseline, -- --size=NAME filters)");
     const run_bench = b.addRunArtifact(bench);
-    run_bench.addArtifactArg(exe);
+    run_bench.addArtifactArg2(exe, .{});
     run_bench.addPassthruArgs();
     bench_step.dependOn(&run_bench.step);
     run_bench.step.dependOn(b.getInstallStep());

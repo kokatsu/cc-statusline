@@ -157,7 +157,7 @@ fn writeFixtureLine(
 fn formatIsoUtc(buf: *[32]u8, ms: i64) []const u8 {
     const c = time.epochToCivil(@divFloor(ms, 1000));
     const ms_part: u64 = @intCast(@mod(ms, 1000));
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
         c.year, c.month, c.day, c.hour, c.minute, c.second, ms_part,
     }) catch unreachable;
 }
@@ -188,7 +188,7 @@ fn writeFixtures(io: Io, files: u32, lines: u32, now_ms: i64) !FixtureStats {
 
     var fi: u32 = 0;
     while (fi < files) : (fi += 1) {
-        const rel = try std.fmt.bufPrint(&path_buf, "cc-statusline-bench/projects/proj-bench/file-{d}.jsonl", .{fi});
+        const rel = try std.mem.print(&path_buf, "cc-statusline-bench/projects/proj-bench/file-{d}.jsonl", .{fi});
         var f = try tmp.createFile(io, rel, .{});
         defer f.close(io);
         var fbuf: [16 * 1024]u8 = undefined;
@@ -474,17 +474,17 @@ const Result = struct {
 
 fn fmtNs(buf: []u8, ns: u64) []const u8 {
     const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-    if (ms >= 1.0) return std.fmt.bufPrint(buf, "{d:.2} ms", .{ms}) catch buf[0..0];
+    if (ms >= 1.0) return std.mem.print(buf, "{d:.2} ms", .{ms}) catch buf[0..0];
     const us = @as(f64, @floatFromInt(ns)) / 1_000.0;
-    if (us >= 1.0) return std.fmt.bufPrint(buf, "{d:.1} us", .{us}) catch buf[0..0];
-    return std.fmt.bufPrint(buf, "{d} ns", .{ns}) catch buf[0..0];
+    if (us >= 1.0) return std.mem.print(buf, "{d:.1} us", .{us}) catch buf[0..0];
+    return std.mem.print(buf, "{d} ns", .{ns}) catch buf[0..0];
 }
 
 fn fmtBytes(buf: []u8, n: u64) []const u8 {
     const f = @as(f64, @floatFromInt(n));
-    if (n >= 1024 * 1024) return std.fmt.bufPrint(buf, "{d:.1} MiB", .{f / (1024.0 * 1024.0)}) catch buf[0..0];
-    if (n >= 1024) return std.fmt.bufPrint(buf, "{d:.1} KiB", .{f / 1024.0}) catch buf[0..0];
-    return std.fmt.bufPrint(buf, "{d} B", .{n}) catch buf[0..0];
+    if (n >= 1024 * 1024) return std.mem.print(buf, "{d:.1} MiB", .{f / (1024.0 * 1024.0)}) catch buf[0..0];
+    if (n >= 1024) return std.mem.print(buf, "{d:.1} KiB", .{f / 1024.0}) catch buf[0..0];
+    return std.mem.print(buf, "{d} B", .{n}) catch buf[0..0];
 }
 
 fn diffPct(now: u64, base: ?u64) ?f64 {
@@ -590,7 +590,7 @@ const BaselineEntry = struct {
 };
 
 const BaselineMap = struct {
-    entries: std.StringArrayHashMapUnmanaged(BaselineEntry),
+    entries: std.array_hash_map.String(BaselineEntry),
 
     fn find(self: BaselineMap, size: []const u8) ?BaselineEntry {
         return self.entries.get(size);
@@ -606,7 +606,7 @@ fn readBaseline(io: Io, allocator: std.mem.Allocator) ?BaselineMap {
     const parsed = json.parseFromSlice(json.Value, allocator, data, .{}) catch return null;
     const root = if (parsed.value == .object) parsed.value.object else return null;
 
-    var map: std.StringArrayHashMapUnmanaged(BaselineEntry) = .empty;
+    var map: std.array_hash_map.String(BaselineEntry) = .empty;
     var it = root.iterator();
     while (it.next()) |e| {
         const obj = if (e.value_ptr.* == .object) e.value_ptr.*.object else continue;

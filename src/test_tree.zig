@@ -12,7 +12,7 @@ pub const TestTree = struct {
     pub fn init(allocator: std.mem.Allocator) !TestTree {
         var tmp = std.testing.tmpDir(.{ .iterate = true });
         errdefer tmp.cleanup();
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const n = try tmp.dir.realPath(std.testing.io, &buf);
         return .{ .tmp = tmp, .allocator = allocator, .root = try allocator.dupe(u8, buf[0..n]) };
     }
@@ -24,6 +24,6 @@ pub const TestTree = struct {
 
     /// Absolute path of `rel` under the root; the directory need not exist.
     pub fn path(self: TestTree, rel: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.root, rel });
+        return self.allocator.print("{s}/{s}", .{ self.root, rel });
     }
 };
