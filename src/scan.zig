@@ -60,7 +60,9 @@ const block_duration_ms: i64 = 5 * 60 * 60 * 1000;
 const scan_window_ms: i64 = 25 * 60 * 60 * 1000; // 25h: 24h + 1h margin for timezone offsets
 
 const cache_magic = [4]u8{ 'C', 'C', 'S', 'L' };
-const cache_ver: u32 = 10;
+// Bump on a rate or prefix-matching change too, not only a layout change: the
+// cache holds computed costs, which would otherwise keep the old rates.
+const cache_ver: u32 = 11;
 const file_list_ttl_s: i64 = 300;
 // Actual caches are ~tens of KB; cap at 1 MiB to fail fast on corruption.
 const cache_max_bytes: usize = 1 * 1024 * 1024;
