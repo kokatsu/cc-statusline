@@ -10,7 +10,7 @@ A fast statusline for [Claude Code](https://docs.anthropic.com/en/docs/claude-co
 - **Session Name** — Shows custom session name (📛) set via `--name` or `/rename` (opt-in via `CC_STATUSLINE_SHOW_SESSION=1`)
 - **Subagent Indicator** — Shows current subagent name (🧩) when running inside a Claude Code subagent
 - **200K+ Tier Alert** — 🚨 marker when the conversation has exceeded the 200K-token pricing tier
-- **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour (opt-out via `CC_STATUSLINE_SHOW_COST=0`)
+- **Cost Tracking** — Today's total cost, current block cost (5h window), burn rate per hour (opt-out via `CC_STATUSLINE_SHOW_COST=0`, or `CC_STATUSLINE_SHOW_BLOCK=0` for the block cost and burn rate only)
 - **Rate Limits** — 5-hour and 7-day usage percentage with color-coded progress bars and reset countdown, plus the spend limit (💳) behind a Claude apps gateway
 - **Prompt Cache** — Warm/cold state with a TTL-relative countdown (💾), cache hit ratio (🎯), and the dollar cost of re-caching if the prefix goes cold (💸), priced from the model's cache-write rate (opt-in via `CC_STATUSLINE_SHOW_CACHE=1`)
 - **Smart Caching** — Two-tier binary cache at `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/statusline-cache.bin` (30s result TTL, 5m file list TTL) with incremental diff parsing for near-zero overhead
@@ -152,6 +152,13 @@ Hiding the line does not skip the transcript scan. The scan runs on every invoca
 cache keeps a `block` computed from Claude Code's real 5-hour reset window, which only a call with a
 session JSON on stdin can supply.
 
+Set `CC_STATUSLINE_SHOW_BLOCK=0` to keep the line but drop its block cost (📊) and burn rate (🔥),
+leaving only today's total:
+
+```sh
+export CC_STATUSLINE_SHOW_BLOCK=0
+```
+
 ### Standalone Use (Empty Stdin)
 
 When nothing is piped to stdin, cc-statusline emits exactly one line: the cost line. The model and
@@ -162,6 +169,13 @@ themselves, such as a tmux status-bar command:
 ```sh
 cc-statusline </dev/null
 # 💰 $2.16 today | 📊 $2.16 block 🔥 $12.36 /h
+```
+
+`CC_STATUSLINE_SHOW_BLOCK=0` still applies here, since today's total keeps the line non-empty:
+
+```sh
+CC_STATUSLINE_SHOW_BLOCK=0 cc-statusline </dev/null
+# 💰 $2.16 today
 ```
 
 Malformed JSON on stdin still produces both lines, so a broken pipeline is visible as `Unknown`. A

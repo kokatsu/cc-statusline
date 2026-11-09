@@ -72,6 +72,10 @@ pub const Theme = struct {
     /// Render the cost line. Opt-out: `initTheme` disables it only when
     /// `CC_STATUSLINE_SHOW_COST=0`. Ignored when stdin is absent (see `printOutput`).
     show_cost: bool = true,
+    /// Render the block cost and burn rate on the cost line. Opt-out:
+    /// `initTheme` disables it only when `CC_STATUSLINE_SHOW_BLOCK=0`. Unlike
+    /// `show_cost` it also applies when stdin is absent.
+    show_block: bool = true,
     /// Effort-level colors, mirroring Claude Code's `/effort` slider theme
     /// keys (low=warning, medium=success, high=permission, xhigh=autoAccept).
     /// Defaults are the built-in dark theme's values; unknown levels fall
@@ -295,8 +299,9 @@ pub fn initTheme(env: *const std.process.Environ.Map) Theme {
     theme.cols = cols;
     theme.show_session = if (env.get("CC_STATUSLINE_SHOW_SESSION")) |v| mem.eql(u8, v, "1") else false;
     theme.show_cache = if (env.get("CC_STATUSLINE_SHOW_CACHE")) |v| mem.eql(u8, v, "1") else false;
-    // Opt-out, unlike the SHOW_* flags above: the cost line is on unless "0".
+    // Opt-out, unlike the SHOW_* flags above: on unless "0".
     theme.show_cost = if (env.get("CC_STATUSLINE_SHOW_COST")) |v| !mem.eql(u8, v, "0") else true;
+    theme.show_block = if (env.get("CC_STATUSLINE_SHOW_BLOCK")) |v| !mem.eql(u8, v, "0") else true;
     return theme;
 }
 
@@ -948,7 +953,7 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
         if (scan) |s| {
             var today_buf: [32]u8 = undefined;
             try w.print("\xf0\x9f\x92\xb0 {s}{s}{s} today", .{ theme.yellow, formatCurrency(&today_buf, s.today_cost), theme.reset });
-            if (s.block) |block| {
+            if (theme.show_block) if (s.block) |block| {
                 var block_buf: [32]u8 = undefined;
                 try w.print(" {s}|{s} \xf0\x9f\x93\x8a {s}{s}{s} block", .{
                     theme.dim,
@@ -959,7 +964,7 @@ pub fn printOutput(w: *Writer, theme: Theme, stdin_info: StdinInfo, scan: ?ScanR
                 });
                 var rate_buf: [32]u8 = undefined;
                 try w.print(" \xf0\x9f\x94\xa5 {s}{s}{s} {s}/h{s}", .{ theme.yellow, formatCurrency(&rate_buf, block.burn_rate_per_hr), theme.reset, theme.dim, theme.reset });
-            }
+            };
         } else {
             try w.writeAll("\xf0\x9f\x92\xb0 N/A today");
         }
@@ -1465,6 +1470,16 @@ test "initTheme shows the cost line unless CC_STATUSLINE_SHOW_COST=0" {
     try std.testing.expect(!initTheme(&env).show_cost);
 }
 
+test "initTheme shows the block segment unless CC_STATUSLINE_SHOW_BLOCK=0" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expect(initTheme(&env).show_block);
+    try env.put("CC_STATUSLINE_SHOW_BLOCK", "1");
+    try std.testing.expect(initTheme(&env).show_block);
+    try env.put("CC_STATUSLINE_SHOW_BLOCK", "0");
+    try std.testing.expect(!initTheme(&env).show_block);
+}
+
 test "printOutput line1 no session name omits name badge emoji" {
     var aw: Writer.Allocating = .init(std.testing.allocator);
     defer aw.deinit();
@@ -1565,6 +1580,35 @@ test "printOutput line2 block cost and burn rate" {
     try std.testing.expect(contains(out, "$0.80"));
     try std.testing.expect(contains(out, "/h"));
     try std.testing.expect(contains(out, "\xf0\x9f\x94\xa5")); // 🔥
+}
+
+test "printOutput show_block=false drops block cost and burn rate, with or without stdin" {
+    const scan = ScanResult{
+        .today_cost = 0.50,
+        .block = .{
+            .start_ms = 0,
+            .end_ms = 5 * 3600 * 1000,
+            .cost = 2.00,
+            .burn_rate_per_hr = 0.80,
+        },
+    };
+    var theme = theme_default;
+    theme.show_block = false;
+    for ([_]bool{ false, true }) |stdin_absent| {
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        // Standalone ignores show_cost, so the line must survive both flags off.
+        theme.show_cost = !stdin_absent;
+        try printOutput(&aw.writer, theme, StdinInfo{ .stdin_absent = stdin_absent }, scan, 0, 0, null);
+        const out = aw.writer.buffered();
+        try std.testing.expect(contains(out, "$0.50"));
+        try std.testing.expect(contains(out, "today\n"));
+        try std.testing.expect(!contains(out, "block"));
+        try std.testing.expect(!contains(out, "\xf0\x9f\x93\x8a")); // 📊
+        try std.testing.expect(!contains(out, "\xf0\x9f\x94\xa5")); // 🔥
+        try std.testing.expect(!contains(out, "/h"));
+        if (stdin_absent) try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+    }
 }
 
 test "printOutput line2 scan null" {
